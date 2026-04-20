@@ -1,0 +1,17 @@
+.env
+.env.*
+**/.env
+**/.env.*
+
+node_modules/
+dist/
+build/
+.vite/
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
+*.pyo
+*.sqlite
+*.db
+*.tsbuildinfo

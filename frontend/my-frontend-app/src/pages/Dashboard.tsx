@@ -1,5 +1,7 @@
 import axios from 'axios'
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { driver } from 'driver.js'
+import 'driver.js/dist/driver.css'
 import {
   Bar,
   BarChart,
@@ -140,8 +142,9 @@ type TqrField = {
   reviewReason?: string | null
   actualMinutes?: number
   expectedMinutes?: number | null
+  benchmarkSource?: 'industry' | 'company' | 'none'
   mandatoryPhotosPresent?: { location: boolean; workBefore: boolean; workAfter: boolean; jobCompletion: boolean }
-}
+  }
 
 type TqrFields = {
   customerSignature?: TqrField
@@ -169,13 +172,17 @@ type TqrResult = {
 type Appointment = {
   Id: string
   Trade_Group_Postcode__c?: string
+  Trade_Group_Region__c?: string
   Allocated_Engineer__c?: string
+  AllocatedEngineerName?: string
   Feedback_Notes__c?: string
   AppointmentNumber?: string
   Status?: string
   Scheduled_Trade__c?: string
   Description?: string
+  ActualStartTimeFormatted?: string
   ActualEndTimeFormatted?: string
+  Attendance_Notes_for_Office__c?: string
   Attendance_Report_for_Customer__c?: string
   Workmanship__c?: string
   Workmanship1__c?: string
@@ -196,6 +203,7 @@ type Appointment = {
   Subject?: string
   tqrResult?: TqrResult | null
   tqrScore?: number | null
+  documents?: RelatedDocument[]
   workOrderId?: string | null
   workOrder?: {
     Id: string
@@ -215,6 +223,16 @@ type Appointment = {
   } | null
   site?: string | null
   accountManager?: string | null
+}
+
+type RelatedDocument = {
+  id: string
+  title: string
+  fileType?: string
+  contentType?: string
+  source?: string
+  category?: string
+  externalUrl?: string
 }
 
 type DashboardStats = {
@@ -301,8 +319,220 @@ const tableCell: React.CSSProperties = {
 
 const formatMoney = (value?: number | null) => new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP' }).format(value ?? 0)
 const formatDate = (value?: string | null) => value || 'N/A'
-const getTradeGroupLabel = (appointment: Pick<Appointment, 'Trade_Group_Postcode__c' | 'Scheduled_Trade__c'>) =>
-  appointment.Trade_Group_Postcode__c?.trim() || appointment.Scheduled_Trade__c?.trim() || 'Unknown'
+const getTradeGroupLabel = (appointment: Pick<Appointment, 'Trade_Group_Region__c' | 'Trade_Group_Postcode__c' | 'Scheduled_Trade__c'>) =>
+  appointment.Trade_Group_Region__c?.trim() || appointment.Trade_Group_Postcode__c?.trim() || appointment.Scheduled_Trade__c?.trim() || 'Unknown'
+const getStartTimeLabel = (appointment: Pick<Appointment, 'ActualStartTimeFormatted' | 'SchedStartTimeFormatted' | 'ArrivalWindowStartTimeFormatted'>) =>
+  appointment.ActualStartTimeFormatted || appointment.SchedStartTimeFormatted || appointment.ArrivalWindowStartTimeFormatted
+const getScoreBandExplanation = (score?: number) => {
+  if (score === undefined || score === null) return null
+  if (score >= 9) return { band: '9-10', label: 'Perfect', why: 'The AI judged the evidence to be top-tier: clear documentation, strong finish quality, and no visible concerns.' }
+  if (score >= 7) return { band: '7-8', label: 'Good', why: 'The AI judged the work as competent and professional, but not exceptional enough to move into the Perfect band.' }
+  if (score >= 5) return { band: '5-6', label: 'Acceptable', why: 'The AI found the work completed, but with enough gaps or concerns that a trade manager should look more closely.' }
+  if (score >= 3) return { band: '3-4', label: 'Non Acceptable', why: 'The AI found significant quality concerns, incomplete work, or evidence that falls below a competent standard.' }
+  return { band: '0-2', label: 'Urgent Issue', why: 'The AI found a safety concern, damage, or a serious enough issue to trigger the lowest band.' }
+}
+
+const getImageQualityBandExplanation = (score?: number) => {
+  if (score === undefined || score === null) return null
+  if (score >= 9) return { band: '9-10', label: 'Good', why: 'The AI judged the photo set as complete and high quality, with all mandatory coverage present and no meaningful gaps.' }
+  if (score >= 7) return { band: '7-8', label: 'Good', why: 'The AI found all mandatory photos present with generally good quality and only minor coverage gaps.' }
+  if (score >= 5) return { band: '5-6', label: 'Poor', why: 'The AI found all mandatory photos present, but quality issues or missing situational shots were enough to keep the score in the lower band.' }
+  if (score >= 3) return { band: '3-4', label: 'Poor', why: 'The AI found a missing mandatory photo or multiple serious quality issues, so the photo set falls below standard.' }
+  return { band: '0-2', label: 'Poor', why: 'The AI found multiple mandatory photos missing or no usable photos at all, which is a fail-level outcome.' }
+}
+
+const getDisplayOutcomeForField = (field: TqrField, opts?: { forceReview?: boolean }) => {
+  if (field.reviewReason || opts?.forceReview) return 'Review'
+  if (field.score !== undefined && field.score !== null) {
+    if (field.score <= 2) return 'Fail'
+    if (field.score <= 6) return 'Review'
+    return 'Pass'
+  }
+  return field.outcome
+}
+
+const getEffectiveSalesforceValueForScore = (key: keyof TqrFields, score?: number) => {
+  if (score === undefined || score === null) return undefined
+  if (key === 'imagesQuality') {
+    if (score >= 9) return 'Perfect'
+    if (score >= 7) return 'Good'
+    if (score >= 5) return 'Acceptable'
+    if (score >= 3) return 'Non Acceptable'
+    return 'Urgent Issue'
+  }
+  if (key === 'workmanship' || key === 'decisionMaking') {
+    if (score >= 9) return 'Perfect'
+    if (score >= 7) return 'Good'
+    if (score >= 5) return 'Acceptable'
+    if (score >= 3) return 'Non Acceptable'
+    return 'Urgent Issue'
+  }
+  if (key === 'report') {
+    if (score >= 9) return 'Perfect'
+    if (score >= 7) return 'Good'
+    if (score >= 5) return 'Acceptable'
+    return 'Non Acceptable'
+  }
+  return undefined
+}
+
+const scoreGuideContent: Record<string, { purpose: string; evidence: string[]; rubric: Array<{ band: string; meaning: string }>; mapping: string[]; triggers: string[]; note?: string }> = {
+  workmanship: {
+    purpose: 'Assesses the quality of the physical work performed from photographic and written evidence. This is a desk-based assessment from documentation, not an on-site inspection.',
+    evidence: [
+      'Before and after photos',
+      'Workmanship close-up photos where applicable',
+      'Parts and materials used',
+      'Job description and engineer notes',
+      'Any flags or concerns raised in notes',
+      'Customer signature and comments recorded alongside',
+    ],
+    rubric: [
+      { band: '9-10 Perfect', meaning: 'Clear before/after evidence, professional finish, correct materials, no visible concerns.' },
+      { band: '7-8 Good', meaning: 'Good standard of work with only minor documentation or finish gaps.' },
+      { band: '5-6 Acceptable', meaning: 'Completed work but signs of rushing, cosmetic issues, or material concerns.' },
+      { band: '3-4 Non Acceptable', meaning: 'Poor finish, incomplete work, or inappropriate materials.' },
+      { band: '0-2 Urgent Issue', meaning: 'Safety concern, damage, fundamentally incorrect approach, or remedial recall risk.' },
+    ],
+    mapping: ['9-10 = Perfect', '7-8 = Good', '5-6 = Acceptable', '3-4 = Non Acceptable', '0-2 = Urgent Issue'],
+    triggers: [
+      'Insufficient photo evidence',
+      'Possible quality issue but AI confidence is low',
+      'Visible damage, safety concern, inappropriate material, or unusual approach',
+      'Engineer notes flag an unresolved issue',
+      'Missing customer signature with thin documentation',
+    ],
+    note: 'The AI is biased toward Good (7-8) for competent jobs and reserves Perfect for genuinely outstanding evidence.',
+  },
+  decisionMaking: {
+    purpose: 'Assesses the quality of judgment calls the engineer made during the visit: whether they diagnosed correctly, chose an appropriate approach, raised further works where needed, generated quotes for additional opportunities, and managed customer expectations.',
+    evidence: [
+      'Job description - both the original problem and the diagnosis reached',
+      'Attendance Report for Customer and Attendance Notes for Office',
+      'Parts used and whether they match the problem',
+      'Further works records raised from this visit',
+      'Quotes generated during or after the visit',
+      'Notes on scope changes, including what was found versus what was expected',
+      'Customer interactions recorded in notes',
+      'Time Taken signal, where very short times may indicate insufficient investigation',
+    ],
+    rubric: [
+      { band: '9-10 Perfect', meaning: 'Correct diagnosis, appropriate approach, commercial opportunities captured, and strong customer expectation management are visible in the notes.' },
+      { band: '7-8 Good', meaning: 'Sound decisions throughout. A minor opportunity may have been missed, but nothing materially wrong with the approach taken.' },
+      { band: '5-6 Acceptable', meaning: 'Adequate decisions overall, but there may be a missed value-add opportunity or a sub-optimal diagnostic approach even if the final outcome was broadly correct.' },
+      { band: '3-4 Non Acceptable', meaning: 'Significant further works were needed but not raised, expectations were poorly managed, or the chosen approach was wrong enough to cost time, money, or trust.' },
+      { band: '0-2 Urgent Issue', meaning: 'A decision created real risk to the customer, engineer, or company, or a serious escalation/safety issue was missed.' },
+    ],
+    mapping: [
+      '9-10 = Perfect',
+      '7-8 = Good',
+      '5-6 = Acceptable',
+      '3-4 = Non Acceptable',
+      '0-2 = Urgent Issue',
+    ],
+    triggers: [
+      'Complex trade-specific judgment that AI cannot assess confidently without domain expertise',
+      'Engineer notes suggest a scope change or customer issue requiring human interpretation',
+      'The job involved a repair-versus-replace decision that is not fully explained in the notes',
+      'Further works or quotes seem likely to have been appropriate but were not raised',
+      'Customer expectation may have been mismanaged, including promises about scope or timing that may not be deliverable',
+    ],
+    note: 'Decision Making is highly subjective. The AI should surface concrete observations from the engineer report and photos, but the Trade Manager remains the final reviewer.',
+  },
+  imagesQuality: {
+    purpose: 'Assesses whether photographic evidence of the job is complete, relevant, and of sufficient quality to document what was done. Photos are the primary evidence source for almost every other TQR field, so this field affects confidence across the wider review.',
+    evidence: [
+      'All images attached to the service appointment',
+      'Trade group and job type, to determine which situational photos apply',
+      'Job description, to understand what should have been documented visually',
+      'Mandatory photo checks: location, work before, work after, and job completion',
+      'Situational photo checks: work during, workmanship close-up, and protection used where applicable',
+    ],
+    rubric: [
+      { band: '9-10 Perfect', meaning: 'All four mandatory photos are present with excellent quality, and applicable situational photos are also present with no meaningful coverage gaps.' },
+      { band: '7-8 Good', meaning: 'All four mandatory photos are present with good quality. Most applicable situational photos are present with only minor quality or coverage gaps.' },
+      { band: '5-6 Acceptable', meaning: 'All four mandatory photos are present, but one or more has quality issues or some applicable situational photos are missing.' },
+      { band: '3-4 Non Acceptable', meaning: 'One mandatory photo is missing, or multiple mandatory photos are too unclear, dark, blurry, or poorly framed to document the work properly.' },
+      { band: '0-2 Urgent Issue', meaning: 'Multiple mandatory photos are missing, or zero photos are attached. This is a fail-level outcome.' },
+    ],
+    mapping: [
+      '9-10 = Perfect',
+      '7-8 = Good',
+      '5-6 = Acceptable',
+      '3-4 = Non Acceptable',
+      '0-2 = Urgent Issue',
+    ],
+    triggers: [
+      'Photos are present but the subject is unclear',
+      'Photos look duplicated instead of showing progression',
+      'A situational photo may be missing but applicability is unclear',
+      'Photo timing suggests images were taken far before or after the job',
+    ],
+    note: 'A job must have all 4 mandatory photos to score 5 or above. If only 1, 2, or 3 mandatory photos are available, Image Quality should stay in the low band.',
+  },
+  report: {
+    purpose: 'Assesses the quality of the written job report - specifically whether the written record is detailed enough for someone unfamiliar with the job to understand what was found, what was done, what parts were used, and what needs to happen next.',
+    evidence: [
+      'Job description and notes field',
+      'Works Completion Summary / Attendance Report for Customer field',
+      'Parts and materials listed',
+      'Comments for Projected Difference, where applicable',
+      'Reason for Projected Difference, where applicable',
+    ],
+    rubric: [
+      { band: '9-10 Perfect', meaning: 'Clear problem statement, complete work summary, all parts listed, explicit next steps where applicable. Professional tone. A future engineer reading this could fully understand what happened.' },
+      { band: '7-8 Good', meaning: 'Clear problem and work summary. One minor element is missing or thin, such as next steps being implied rather than stated, or parts being listed but not quantified.' },
+      { band: '5-6 Acceptable', meaning: 'Describes what was done but is thin on detail, context, or diagnosis reasoning. A future engineer would need to piece things together.' },
+      { band: '3-4 Non Acceptable', meaning: 'One-line report, major structural gaps, or repeated template language without enough job-specific content.' },
+      { band: '0-2 Non Acceptable', meaning: 'Notes are absent, completely incomprehensible, or effectively just copy the booking notes with nothing meaningful added.' },
+    ],
+    mapping: [
+      '9-10 = Perfect',
+      '7-8 = Good',
+      '5-6 = Acceptable',
+      '0-4 = Non Acceptable',
+    ],
+    triggers: [
+      'Notes contain a flag, claim, or complaint that appears to need follow-up but was not resolved',
+      'Notes mention a scope change, customer disagreement, or site issue without resolution',
+      'Template or boilerplate wording appears instead of a job-specific report',
+      'Notes describe work done but the listed parts do not match the written report',
+    ],
+    note: 'Text analysis is usually reliable for report completeness, but Trade Manager confirmation is still required because AI cannot fully assess trade-specific technical accuracy.',
+  },
+  timeTaken: {
+    purpose: 'Assesses whether time spent on site was appropriate for the work completed. Too quick suggests corner-cutting; too long suggests inefficiency, over-servicing, or padding. This field is benchmark-dependent and should surface as review-led when no benchmark exists.',
+    evidence: [
+      'Actual Start time on the service appointment',
+      'Actual End time on the service appointment',
+      'Trade group and scheduled trade',
+      'Job description and scope of actual work performed',
+      'Industry benchmark where available',
+      'Historical company benchmark where available',
+    ],
+    rubric: [
+      { band: '9-10 Ideal', meaning: 'Within 10% of expected time for the specific trade and job type. Suggests confident, efficient work at the right pace.' },
+      { band: '7-8 Good', meaning: 'Within 25% of expected time. Mild over- or under-run but nothing concerning.' },
+      { band: '5-6 Acceptable', meaning: 'Within 50% of expected time. Some justification is reasonable but worth noting.' },
+      { band: '3-4 Concerning', meaning: 'Outside 50% range. Likely rushed or inefficient, and the notes should explain why.' },
+      { band: '0-2 Extreme outlier', meaning: 'Dramatic over- or under-run. Almost always needs a conversation with the engineer.' },
+    ],
+    mapping: [
+      '7-10 = Ideal',
+      '3-6 over expected = Excessive',
+      '3-6 under expected = Rushed',
+      '0-2 over expected = Excessive (severe)',
+      '0-2 under expected = Rushed (severe)',
+    ],
+    triggers: [
+      'No benchmark exists for this trade and job type',
+      'The job type is bespoke or unusual so benchmark confidence is low',
+      'The duration is an extreme outlier in either direction',
+      'Actual times appear inconsistent, such as start after end or zero duration',
+    ],
+    note: 'At launch, Time on Site should usually surface as Review when no benchmark exists. It should not present as a confident Pass without expected-time context.',
+  },
+}
 const escapeHtml = (value?: string | number | null) =>
   String(value ?? '')
     .replaceAll('&', '&amp;')
@@ -384,23 +614,21 @@ function TQRTradeChart({
   visibleRows?: number
 }) {
   const rows = [...data].sort((a, b) => b.count - a.count).slice(0, visibleRows)
-  const chartHeight = 380
-  const shorten = (value: string) => value.length > 20 ? `${value.slice(0, 18)}...` : value
+  const chartHeight = 420
 
   return (
     <div style={{ ...cardStyle, padding: '8px 12px 12px', borderRadius: 0, boxShadow: 'none' }}>
       <ResponsiveContainer width="100%" height={chartHeight}>
-        <BarChart data={rows} margin={{ top: 8, right: 14, bottom: 78, left: 10 }}>
+        <BarChart data={rows} margin={{ top: 8, right: 14, bottom: 118, left: 10 }}>
           <CartesianGrid stroke={colors.grayscale.border.subtle} vertical={false} />
           <XAxis
             dataKey="name"
             stroke={colors.text.grayscale.caption}
-            tickFormatter={shorten}
             angle={-45}
             textAnchor="end"
             interval={0}
-            height={84}
-            tick={{ fontSize: 9, fill: colors.text.grayscale.body, fontFamily: 'inherit' }}
+            height={124}
+            tick={{ fontSize: 8, fill: colors.text.grayscale.body, fontFamily: 'inherit' }}
             tickLine={false}
             axisLine={false}
           />
@@ -428,7 +656,7 @@ function TQRTradeChart({
 
 function DashboardView({ stats }: { stats: DashboardStats | null }) {
   const tradeGroupChartData = useMemo(
-    () => (stats?.byTradeGroup ?? []).map((item) => ({ ...item, name: item.name === 'Unknown' ? 'Scheduled Trade Fallback' : item.name })),
+    () => stats?.byTradeGroup ?? [],
     [stats],
   )
 
@@ -531,7 +759,7 @@ function AppointmentsView({
               {appointments.map((row) => (
                 <tr key={row.Id}>
                   <td style={{ ...tableCell, fontWeight: 600 }}>{getTradeGroupLabel(row)}</td>
-                  <td style={tableCell}>{row.Allocated_Engineer__c || 'Unassigned'}</td>
+                  <td style={tableCell}>{row.AllocatedEngineerName || 'Unassigned'}</td>
                   <td style={tableCell}>{row.Feedback_Notes__c || 'No feedback'}</td>
                   <td style={{ ...tableCell, color: colors.primary.default, fontWeight: 800, cursor: 'pointer' }} onClick={() => onOpenAppointment(row.Id)}>{row.AppointmentNumber || 'N/A'}</td>
                   <td style={tableCell}><StatusBadge status={row.Status} /></td>
@@ -629,8 +857,54 @@ function AppointmentDetailView({
   const outcomeColor = (o?: string) => o === 'Pass' ? '#16a34a' : o === 'Review' ? '#d97706' : '#dc2626'
   const outcomeBackground = (o?: string) => o === 'Pass' ? '#f0fdf4' : o === 'Review' ? '#fffbeb' : '#fef2f2'
   const imageDescriptions = tqrResult?.image_descriptions || []
+  const documents = appointment.documents || []
+  const openDocument = (doc: RelatedDocument) => {
+    if (doc.externalUrl) {
+      window.open(doc.externalUrl, '_blank', 'noopener,noreferrer')
+      return
+    }
+    const base = String(api.defaults.baseURL || '').replace(/\/$/, '')
+    window.open(`${base}/api/content/${doc.id}?inline=true`, '_blank', 'noopener,noreferrer')
+  }
   const getImageDescription = (image: WorkOrderImage) =>
     imageDescriptions.find((item) => item.id === image.id || item.title === image.title)?.description || null
+  const startScoreGuide = () => {
+    const tour = driver({
+      showProgress: true,
+      animate: true,
+      steps: [
+        {
+          element: '[data-driver="tqr-summary"]',
+          popover: {
+            title: 'TQR score summary',
+            description: 'This top bar shows the overall verdict, weighted total score, hard-fail status, and when the AI last analysed the job.',
+          },
+        },
+        {
+          element: '[data-driver="scorecard-workmanship"]',
+          popover: {
+            title: 'Workmanship score',
+            description: 'Workmanship is weighted at 20%. The AI scores it from photos, notes, materials, and any visible risks, then maps that numeric score to the Salesforce picklist.',
+          },
+        },
+        {
+          element: '[data-driver="workmanship-guide"]',
+          popover: {
+            title: 'How the workmanship score is calculated',
+            description: 'This panel lists the evidence sources, scoring bands, Salesforce mapping, review triggers, and the bias toward Good unless evidence is genuinely exceptional.',
+          },
+        },
+        {
+          element: '[data-driver="score-evidence"]',
+          popover: {
+            title: 'Evidence used',
+            description: 'Evidence cited shows the actual observations that drove the score. This is the main explanation the trade manager should review.',
+          },
+        },
+      ],
+    })
+    tour.drive()
+  }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
@@ -661,10 +935,9 @@ function AppointmentDetailView({
           {[
             { label: 'Customer', value: appointment.account?.Name },
             { label: 'Work Type', value: appointment.workOrder?.WorkType?.Name || appointment.Scheduled_Trade__c },
-            { label: 'Engineer', value: appointment.Allocated_Engineer__c },
+            { label: 'Engineer', value: appointment.AllocatedEngineerName },
             { label: 'Actual End', value: appointment.ActualEndTimeFormatted },
             { label: 'Work Order', value: workOrderLabel },
-            { label: 'Duration', value: appointment.Duration ? `${appointment.Duration} mins` : '' },
           ].map(({ label, value }) => (
             <div key={label}>
               <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.18em', textTransform: 'uppercase', color: 'rgba(255,255,255,0.55)', marginBottom: 4 }}>{label}</div>
@@ -700,7 +973,7 @@ function AppointmentDetailView({
           <Field label="Scheduled Trade" value={appointment.Scheduled_Trade__c} />
           <Field label="Trade Group" value={getTradeGroupLabel(appointment)} />
           <Field label="Sector Type" value={appointment.Sector_Type__c} />
-          <Field label="Allocated Engineer" value={appointment.Allocated_Engineer__c} />
+          <Field label="Allocated Engineer" value={appointment.AllocatedEngineerName} />
           <Field label="Scheduled Start" value={appointment.SchedStartTimeFormatted} />
           <Field label="Arrival Window" value={appointment.ArrivalWindowStartTimeFormatted} />
           <Field label="Actual End" value={appointment.ActualEndTimeFormatted} />
@@ -711,8 +984,20 @@ function AppointmentDetailView({
 
       {/* Engineer Job Report */}
       <Section title="Engineer Job Report" accent="#0f766e">
+        <div style={{ display: 'grid', gap: 16, gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', marginBottom: 20 }}>
+          {[
+            { label: 'Actual Start', value: getStartTimeLabel(appointment) },
+            { label: 'Actual End', value: appointment.ActualEndTimeFormatted },
+          ].filter(({ value }) => hasDisplayValue(value)).map(({ label, value }) => (
+            <div key={label} style={{ background: '#f0fdf4', borderRadius: 10, padding: '14px 16px', border: '1px solid #bbf7d0' }}>
+              <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: '#0f766e', marginBottom: 6 }}>{label}</div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: colors.text.grayscale.title }}>{value}</div>
+            </div>
+          ))}
+        </div>
         <div style={{ display: 'grid', gap: '20px 32px', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))' }}>
           {[
+            { label: 'Attendance Notes for Office', value: appointment.Attendance_Notes_for_Office__c },
             { label: 'Attendance Report', value: appointment.Attendance_Report_for_Customer__c },
             { label: 'Feedback Notes', value: appointment.Feedback_Notes__c },
             { label: 'Description', value: appointment.Description },
@@ -723,6 +1008,31 @@ function AppointmentDetailView({
             </div>
           ))}
         </div>
+      </Section>
+
+      <Section title="Related Documents" accent="#7c3aed">
+        {documents.length === 0 ? (
+          <div style={{ fontSize: 13, color: colors.text.grayscale.subtle }}>No invoice, payment, or service report documents found.</div>
+        ) : (
+          <div style={{ display: 'grid', gap: 12 }}>
+            {documents.map((doc) => (
+              <div key={doc.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, padding: '14px 16px', borderRadius: 10, background: '#faf5ff', border: '1px solid #e9d5ff' }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: colors.text.grayscale.title }}>{doc.title}</div>
+                  <div style={{ fontSize: 11, color: colors.text.grayscale.caption, marginTop: 4, textTransform: 'capitalize' }}>
+                    {doc.category || 'document'}{doc.fileType ? ` - ${doc.fileType}` : ''}{doc.source ? ` - ${doc.source}` : ''}
+                  </div>
+                </div>
+                <button
+                  onClick={() => openDocument(doc)}
+                  style={{ background: colors.primary.darker, color: '#fff', border: 'none', borderRadius: 8, padding: '8px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap' }}
+                >
+                  Open
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
       </Section>
 
       {/* TQR AI Analysis */}
@@ -763,10 +1073,12 @@ function AppointmentDetailView({
             <div>
               {/* Score summary bar */}
               <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 24, padding: '18px 24px', background: '#f8fafc', borderRadius: 12, flexWrap: 'wrap' }}>
+              <div data-driver="tqr-summary" style={{ display: 'contents' }} />
                 <div style={{ background: verdictBg, color: '#fff', fontWeight: 800, fontSize: 13, padding: '6px 18px', borderRadius: 8, letterSpacing: '0.04em' }}>{tqrResult.verdict}</div>
                 <div style={{ fontSize: 32, fontWeight: 800, color: verdictBg, lineHeight: 1 }}>{tqrResult.overall}<span style={{ fontSize: 16, fontWeight: 500, color: colors.text.grayscale.caption }}>/10</span></div>
                 {tqrResult.hard_fail && <div style={{ background: '#fef2f2', border: '1px solid #fecaca', color: '#dc2626', fontSize: 11, fontWeight: 700, padding: '4px 12px', borderRadius: 6 }}>Hard Fail Triggered</div>}
                 <div style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
+                  <button style={{ background: colors.primary.subtle, border: `1px solid ${colors.border.primary.subtle}`, borderRadius: 6, padding: '4px 12px', fontSize: 11, fontWeight: 700, color: colors.primary.darker, cursor: 'pointer', fontFamily: 'inherit' }} onClick={startScoreGuide}>How scoring works</button>
                   <span style={{ fontSize: 11, color: colors.text.grayscale.caption }}>{tqrResult.analysed_at}</span>
                   <button style={{ background: 'transparent', border: `1px solid ${colors.grayscale.border.default}`, borderRadius: 6, padding: '4px 12px', fontSize: 11, fontWeight: 600, color: colors.text.grayscale.body, cursor: 'pointer', fontFamily: 'inherit' }} onClick={() => appointment?.Id && onReanalyse(appointment.Id)}>Re-analyse</button>
                 </div>
@@ -793,10 +1105,76 @@ function AppointmentDetailView({
                 {fields && fieldDefs.map(({ key, label, weight }) => {
                   const f = fields[key]
                   if (!f) return null
-                  const oc = outcomeColor(f.outcome)
-                  const obg = outcomeBackground(f.outcome)
+                  const imageQuality = fields?.imagesQuality
+                  const mandatoryPhotos = imageQuality?.mandatoryPhotosPresent
+                  const missingWorkmanshipCorePhotos = key === 'workmanship' && (!mandatoryPhotos?.workBefore || !mandatoryPhotos?.workAfter)
+                  const synthesizedPaymentReviewReason =
+                    key === 'paymentAttempted'
+                    && !f.reviewReason
+                    && f.value === 'No'
+                    && (f.evidenceCited || []).some((item) => item.toLowerCase().includes('paymentstatus is null'))
+                      ? 'No invoice or payment evidence is visible for this chargeable job, so payment needs manual review.'
+                      : null
+                  const effectiveReviewReason = f.reviewReason || synthesizedPaymentReviewReason
+                  const missingTimeBenchmark = key === 'timeTaken' && ((f.expectedMinutes ?? null) === null || f.benchmarkSource === 'none')
+                  const fieldForDisplay = missingWorkmanshipCorePhotos
+                    ? {
+                        ...f,
+                        score: 2,
+                        outcome: 'Fail',
+                        salesforceValue: 'Urgent Issue',
+                        rationale: 'Workmanship cannot be passed because the core before/after photo evidence is missing.',
+                        reviewReason: null,
+                        urgentIssueDescription: 'Missing work-before and/or work-after photos means workmanship cannot be validated properly.',
+                      }
+                    : effectiveReviewReason
+                      ? { ...f, reviewReason: effectiveReviewReason }
+                      : f
+                  const displayOutcome = getDisplayOutcomeForField(fieldForDisplay, { forceReview: missingTimeBenchmark })
+                  const oc = outcomeColor(displayOutcome)
+                  const obg = outcomeBackground(displayOutcome)
+                  const scoreBand = key === 'imagesQuality'
+                    ? getImageQualityBandExplanation(fieldForDisplay.score)
+                    : key === 'workmanship' || key === 'decisionMaking'
+                      ? getScoreBandExplanation(fieldForDisplay.score)
+                      : null
+                  const missingWorkmanshipEvidence = key === 'workmanship' ? [
+                    !mandatoryPhotos?.workBefore ? 'No clear work-before photo was available for the AI to judge the starting condition.' : null,
+                    !mandatoryPhotos?.workAfter ? 'No clear work-after photo was available for the AI to judge the finished outcome.' : null,
+                    (fieldForDisplay.reviewReason?.toLowerCase().includes('insufficient photo evidence') || fieldForDisplay.rationale?.toLowerCase().includes('photo evidence is limited')) ? 'The AI marked this for review because the available photo evidence was not strong enough to judge workmanship confidently.' : null,
+                  ].filter(Boolean) as string[] : []
+                  const decisionMakingEvidence = key === 'decisionMaking' ? [
+                    appointment.Attendance_Report_for_Customer__c ? 'Attendance Report for Customer was used to assess diagnosis, actions taken, and customer-facing next steps.' : null,
+                    appointment.Attendance_Notes_for_Office__c ? 'Attendance Notes for Office were used to assess office-facing context, escalations, and expectation management.' : null,
+                    appointment.Description ? 'Job Description was used to compare the original problem with the diagnosis and approach reached on site.' : null,
+                    f.reviewReason?.toLowerCase().includes('scope') ? 'The AI found a possible scope-change or customer-handling issue that needs human review.' : null,
+                    f.reviewReason?.toLowerCase().includes('quote') || f.rationale?.toLowerCase().includes('quote') ? 'The AI considered whether further works or quotes should have been raised based on the engineer report.' : null,
+                  ].filter(Boolean) as string[] : []
+                  const imageQualityEvidence = key === 'imagesQuality' ? [
+                    mandatoryPhotos?.location ? null : 'Mandatory location photo is missing.',
+                    mandatoryPhotos?.workBefore ? null : 'Mandatory work-before photo is missing.',
+                    mandatoryPhotos?.workAfter ? null : 'Mandatory work-after photo is missing.',
+                    mandatoryPhotos?.jobCompletion ? null : 'Mandatory job-completion photo is missing.',
+                    [mandatoryPhotos?.location, mandatoryPhotos?.workBefore, mandatoryPhotos?.workAfter, mandatoryPhotos?.jobCompletion].filter(Boolean).length < 4
+                      ? `Only ${[mandatoryPhotos?.location, mandatoryPhotos?.workBefore, mandatoryPhotos?.workAfter, mandatoryPhotos?.jobCompletion].filter(Boolean).length} of 4 mandatory photos were detected, so the score should stay in the low band.`
+                      : null,
+                  ].filter(Boolean) as string[] : []
+                  const reportEvidence = key === 'report' ? [
+                    appointment.Description ? 'Job Description was used to assess whether the report explains the original problem clearly.' : null,
+                    appointment.Attendance_Report_for_Customer__c ? 'Attendance Report for Customer was used to assess work summary, actions taken, and next steps.' : null,
+                    f.reviewReason?.toLowerCase().includes('scope') ? 'The AI found a possible unresolved scope change or site issue in the written report.' : null,
+                    f.reviewReason?.toLowerCase().includes('complaint') ? 'The AI found a flag or complaint in the notes that may require follow-up.' : null,
+                  ].filter(Boolean) as string[] : []
+                  const timeTakenEvidence = key === 'timeTaken' ? [
+                    getStartTimeLabel(appointment) ? `Actual Start recorded as ${getStartTimeLabel(appointment)}.` : null,
+                    appointment.ActualEndTimeFormatted ? `Actual End recorded as ${appointment.ActualEndTimeFormatted}.` : null,
+                    f.actualMinutes !== undefined ? `Calculated duration is ${f.actualMinutes} minutes.` : null,
+                    (f.expectedMinutes ?? null) !== null ? `Expected benchmark duration is ${f.expectedMinutes} minutes.` : 'No expected benchmark duration is available for this job, so Time on Site should stay in review.',
+                    appointment.Scheduled_Trade__c ? `Scheduled Trade considered: ${appointment.Scheduled_Trade__c}.` : null,
+                    appointment.Trade_Group_Region__c || appointment.Trade_Group_Postcode__c ? `Trade Group considered: ${appointment.Trade_Group_Region__c || appointment.Trade_Group_Postcode__c}.` : null,
+                  ].filter(Boolean) as string[] : []
                   return (
-                    <div key={key} style={{ border: `1px solid ${colors.grayscale.border.default}`, borderRadius: 12, overflow: 'hidden', background: '#fff' }}>
+                    <div key={key} data-driver={key === 'workmanship' ? 'scorecard-workmanship' : undefined} style={{ border: `1px solid ${colors.grayscale.border.default}`, borderRadius: 12, overflow: 'hidden', background: '#fff' }}>
                       <div style={{ background: obg, padding: '12px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                         <div>
                           <div style={{ fontSize: 12, fontWeight: 700, color: colors.primary.darker }}>{label}</div>
@@ -805,22 +1183,331 @@ function AppointmentDetailView({
                         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                           {f.score !== undefined && <span style={{ fontSize: 22, fontWeight: 800, color: oc }}>{f.score}</span>}
                           {f.value !== undefined && f.score === undefined && <span style={{ fontSize: 14, fontWeight: 700, color: oc }}>{f.value}</span>}
-                          <span style={{ fontSize: 11, fontWeight: 700, color: oc, background: '#fff', border: `1px solid ${oc}`, padding: '2px 10px', borderRadius: 20 }}>{f.outcome}</span>
+                            <span style={{ fontSize: 11, fontWeight: 700, color: oc, background: '#fff', border: `1px solid ${oc}`, padding: '2px 10px', borderRadius: 20 }}>{displayOutcome}</span>
                         </div>
                       </div>
-                      <div style={{ padding: '12px 16px' }}>
-                        {f.salesforceValue && <div style={{ fontSize: 11, color: colors.text.grayscale.caption, marginBottom: 6, fontWeight: 600 }}>{f.salesforceValue}</div>}
-                        {f.rationale && <div style={{ fontSize: 12, color: colors.text.grayscale.body, lineHeight: 1.6 }}>{f.rationale}</div>}
-                        {f.reviewReason && <div style={{ fontSize: 11, color: '#d97706', marginTop: 8, padding: '6px 10px', background: '#fffbeb', borderRadius: 6 }}>Review required: {f.reviewReason}</div>}
-                        {f.urgentIssueDescription && <div style={{ fontSize: 11, color: '#dc2626', marginTop: 8, padding: '6px 10px', background: '#fef2f2', borderRadius: 6, fontWeight: 600 }}>! {f.urgentIssueDescription}</div>}
+                        <div style={{ padding: '12px 16px' }}>
+                          {fieldForDisplay.salesforceValue && <div style={{ fontSize: 11, color: colors.text.grayscale.caption, marginBottom: 6, fontWeight: 600 }}>{fieldForDisplay.salesforceValue}</div>}
+                          {(fieldForDisplay.rationale || synthesizedPaymentReviewReason) && <div style={{ fontSize: 12, color: colors.text.grayscale.body, lineHeight: 1.6 }}>{synthesizedPaymentReviewReason ? 'Charge total exists, but invoice/payment evidence is not visible in the job record.' : fieldForDisplay.rationale}</div>}
+                          {effectiveReviewReason && <div style={{ fontSize: 11, color: '#d97706', marginTop: 8, padding: '6px 10px', background: '#fffbeb', borderRadius: 6 }}>Review required: {effectiveReviewReason}</div>}
+                          {fieldForDisplay.urgentIssueDescription && <div style={{ fontSize: 11, color: '#dc2626', marginTop: 8, padding: '6px 10px', background: '#fef2f2', borderRadius: 6, fontWeight: 600 }}>! {fieldForDisplay.urgentIssueDescription}</div>}
                         {(f.missedOpportunities?.length ?? 0) > 0 && (
                           <div style={{ marginTop: 8 }}>{f.missedOpportunities!.map((m, i) => <div key={i} style={{ fontSize: 11, color: '#d97706', marginTop: 3 }}>- {m}</div>)}</div>
                         )}
                         {(f.evidenceCited?.length ?? 0) > 0 && (
-                          <details style={{ marginTop: 10 }}>
+                          <details style={{ marginTop: 10 }} data-driver={key === 'workmanship' ? 'score-evidence' : undefined}>
                             <summary style={{ fontSize: 11, color: colors.text.grayscale.caption, cursor: 'pointer', userSelect: 'none' }}>Evidence cited ({f.evidenceCited!.length})</summary>
                             <div style={{ marginTop: 6, paddingLeft: 8, borderLeft: `2px solid ${colors.grayscale.border.subtle}` }}>
                               {f.evidenceCited!.map((e, i) => <div key={i} style={{ fontSize: 11, color: colors.text.grayscale.subtle, marginTop: 3, lineHeight: 1.5 }}>{e}</div>)}
+                            </div>
+                          </details>
+                        )}
+                        {key === 'workmanship' && scoreGuideContent.workmanship && (
+                          <details style={{ marginTop: 10 }} data-driver="workmanship-guide">
+                            <summary style={{ fontSize: 11, color: colors.primary.darker, cursor: 'pointer', userSelect: 'none', fontWeight: 700 }}>Why this workmanship score was given</summary>
+                            <div style={{ marginTop: 10, display: 'grid', gap: 10 }}>
+                              {scoreBand && (
+                                <div style={{ background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 8, padding: '10px 12px' }}>
+                                  <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>Why this exact score</div>
+                                  <div style={{ fontSize: 12, fontWeight: 700, color: colors.primary.darker }}>
+                                    Score {fieldForDisplay.score} sits in the {scoreBand.band} band, which maps to {scoreBand.label} in Salesforce.
+                                  </div>
+                                  <div style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 6, lineHeight: 1.6 }}>
+                                    {scoreBand.why}
+                                  </div>
+                                  {f.rationale && (
+                                    <div style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 6, lineHeight: 1.6 }}>
+                                        AI reasoning for this job: {fieldForDisplay.rationale}
+                                    </div>
+                                  )}
+                                  {missingWorkmanshipEvidence.length > 0 && (
+                                    <div style={{ marginTop: 8, padding: '8px 10px', background: '#fff7ed', border: '1px solid #fdba74', borderRadius: 8 }}>
+                                      <div style={{ fontSize: 10, fontWeight: 700, color: '#9a3412', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>
+                                        Evidence gap affecting this score
+                                      </div>
+                                      {missingWorkmanshipEvidence.map((item) => (
+                                        <div key={item} style={{ fontSize: 11, color: '#9a3412', marginTop: 4, lineHeight: 1.5 }}>
+                                          - {item}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                              <div style={{ fontSize: 11, color: colors.text.grayscale.body, lineHeight: 1.6 }}>{scoreGuideContent.workmanship.purpose}</div>
+                              <div>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Evidence sources</div>
+                                {scoreGuideContent.workmanship.evidence.map((item) => <div key={item} style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 4 }}>- {item}</div>)}
+                              </div>
+                              <div>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Scoring rubric</div>
+                                {scoreGuideContent.workmanship.rubric.map((item) => <div key={item.band} style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 4 }}><strong>{item.band}:</strong> {item.meaning}</div>)}
+                              </div>
+                              <div>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Salesforce mapping</div>
+                                {scoreGuideContent.workmanship.mapping.map((item) => <div key={item} style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 4 }}>{item}</div>)}
+                              </div>
+                              {f.salesforceValue && (
+                                <div style={{ background: '#f8fafc', borderRadius: 8, padding: '8px 10px', border: `1px solid ${colors.grayscale.border.subtle}` }}>
+                                  <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>Salesforce result for this job</div>
+                                  <div style={{ fontSize: 11, color: colors.text.grayscale.body }}>
+                                      The AI returned a score of {fieldForDisplay.score}, so the Salesforce picklist value is <strong>{fieldForDisplay.salesforceValue}</strong>.
+                                  </div>
+                                </div>
+                              )}
+                              <div>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em' }}>AI review triggers</div>
+                                {scoreGuideContent.workmanship.triggers.map((item) => <div key={item} style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 4 }}>- {item}</div>)}
+                              </div>
+                              <div style={{ fontSize: 11, color: '#0f766e', background: '#f0fdf4', borderRadius: 8, padding: '8px 10px' }}>{scoreGuideContent.workmanship.note}</div>
+                            </div>
+                          </details>
+                        )}
+                        {key === 'decisionMaking' && scoreGuideContent.decisionMaking && (
+                          <details style={{ marginTop: 10 }}>
+                            <summary style={{ fontSize: 11, color: colors.primary.darker, cursor: 'pointer', userSelect: 'none', fontWeight: 700 }}>Why this decision making score was given</summary>
+                            <div style={{ marginTop: 10, display: 'grid', gap: 10 }}>
+                              {scoreBand && (
+                                <div style={{ background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 8, padding: '10px 12px' }}>
+                                  <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>Why this exact score</div>
+                                  <div style={{ fontSize: 12, fontWeight: 700, color: colors.primary.darker }}>
+                                    Score {fieldForDisplay.score} sits in the {scoreBand.band} band, which maps to {scoreBand.label} in Salesforce.
+                                  </div>
+                                  <div style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 6, lineHeight: 1.6 }}>
+                                    {scoreBand.why}
+                                  </div>
+                                  {f.rationale && (
+                                    <div style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 6, lineHeight: 1.6 }}>
+                                      AI reasoning for this job: {fieldForDisplay.rationale}
+                                    </div>
+                                  )}
+                                  {decisionMakingEvidence.length > 0 && (
+                                    <div style={{ marginTop: 8, padding: '8px 10px', background: '#fff7ed', border: '1px solid #fdba74', borderRadius: 8 }}>
+                                      <div style={{ fontSize: 10, fontWeight: 700, color: '#9a3412', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>
+                                        Engineer report evidence affecting this score
+                                      </div>
+                                      {decisionMakingEvidence.map((item) => (
+                                        <div key={item} style={{ fontSize: 11, color: '#9a3412', marginTop: 4, lineHeight: 1.5 }}>
+                                          - {item}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                              <div style={{ fontSize: 11, color: colors.text.grayscale.body, lineHeight: 1.6 }}>{scoreGuideContent.decisionMaking.purpose}</div>
+                              <div>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Evidence sources</div>
+                                {scoreGuideContent.decisionMaking.evidence.map((item) => <div key={item} style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 4 }}>- {item}</div>)}
+                              </div>
+                              <div>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Scoring rubric</div>
+                                {scoreGuideContent.decisionMaking.rubric.map((item) => <div key={item.band} style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 4 }}><strong>{item.band}:</strong> {item.meaning}</div>)}
+                              </div>
+                              <div>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Salesforce mapping</div>
+                                {scoreGuideContent.decisionMaking.mapping.map((item) => <div key={item} style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 4 }}>{item}</div>)}
+                              </div>
+                              {f.salesforceValue && (
+                                <div style={{ background: '#f8fafc', borderRadius: 8, padding: '8px 10px', border: `1px solid ${colors.grayscale.border.subtle}` }}>
+                                  <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>Salesforce result for this job</div>
+                                  <div style={{ fontSize: 11, color: colors.text.grayscale.body }}>
+                                      The AI returned a score of {fieldForDisplay.score}, so the Salesforce picklist value is <strong>{fieldForDisplay.salesforceValue}</strong>.
+                                  </div>
+                                </div>
+                              )}
+                              <div>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em' }}>AI review triggers</div>
+                                {scoreGuideContent.decisionMaking.triggers.map((item) => <div key={item} style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 4 }}>- {item}</div>)}
+                              </div>
+                              <div style={{ fontSize: 11, color: '#0f766e', background: '#f0fdf4', borderRadius: 8, padding: '8px 10px' }}>{scoreGuideContent.decisionMaking.note}</div>
+                            </div>
+                          </details>
+                        )}
+                        {key === 'imagesQuality' && scoreGuideContent.imagesQuality && (
+                          <details style={{ marginTop: 10 }}>
+                            <summary style={{ fontSize: 11, color: colors.primary.darker, cursor: 'pointer', userSelect: 'none', fontWeight: 700 }}>Why this image quality score was given</summary>
+                            <div style={{ marginTop: 10, display: 'grid', gap: 10 }}>
+                              {scoreBand && (
+                                <div style={{ background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 8, padding: '10px 12px' }}>
+                                  <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>Why this exact score</div>
+                                  <div style={{ fontSize: 12, fontWeight: 700, color: colors.primary.darker }}>
+                                    Score {fieldForDisplay.score} sits in the {scoreBand.band} band, which maps to {scoreBand.label} in Salesforce.
+                                  </div>
+                                  <div style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 6, lineHeight: 1.6 }}>
+                                    {scoreBand.why}
+                                  </div>
+                                  {f.rationale && (
+                                    <div style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 6, lineHeight: 1.6 }}>
+                                      AI reasoning for this job: {fieldForDisplay.rationale}
+                                    </div>
+                                  )}
+                                  {imageQualityEvidence.length > 0 && (
+                                    <div style={{ marginTop: 8, padding: '8px 10px', background: '#fff7ed', border: '1px solid #fdba74', borderRadius: 8 }}>
+                                      <div style={{ fontSize: 10, fontWeight: 700, color: '#9a3412', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>
+                                        Mandatory photo validation affecting this score
+                                      </div>
+                                      {imageQualityEvidence.map((item) => (
+                                        <div key={item} style={{ fontSize: 11, color: '#9a3412', marginTop: 4, lineHeight: 1.5 }}>
+                                          - {item}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                              <div style={{ fontSize: 11, color: colors.text.grayscale.body, lineHeight: 1.6 }}>{scoreGuideContent.imagesQuality.purpose}</div>
+                              <div>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Evidence sources</div>
+                                {scoreGuideContent.imagesQuality.evidence.map((item) => <div key={item} style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 4 }}>- {item}</div>)}
+                              </div>
+                              <div>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Scoring rubric</div>
+                                {scoreGuideContent.imagesQuality.rubric.map((item) => <div key={item.band} style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 4 }}><strong>{item.band}:</strong> {item.meaning}</div>)}
+                              </div>
+                              <div>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Salesforce mapping</div>
+                                {scoreGuideContent.imagesQuality.mapping.map((item) => <div key={item} style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 4 }}>{item}</div>)}
+                              </div>
+                              {f.salesforceValue && (
+                                <div style={{ background: '#f8fafc', borderRadius: 8, padding: '8px 10px', border: `1px solid ${colors.grayscale.border.subtle}` }}>
+                                  <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>Salesforce result for this job</div>
+                                  <div style={{ fontSize: 11, color: colors.text.grayscale.body }}>
+                                      The AI returned a score of {fieldForDisplay.score}, so the Salesforce picklist value is <strong>{fieldForDisplay.salesforceValue}</strong>.
+                                  </div>
+                                </div>
+                              )}
+                              <div>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em' }}>AI review triggers</div>
+                                {scoreGuideContent.imagesQuality.triggers.map((item) => <div key={item} style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 4 }}>- {item}</div>)}
+                              </div>
+                              <div style={{ fontSize: 11, color: '#0f766e', background: '#f0fdf4', borderRadius: 8, padding: '8px 10px' }}>{scoreGuideContent.imagesQuality.note}</div>
+                            </div>
+                          </details>
+                        )}
+                        {key === 'report' && scoreGuideContent.report && (
+                          <details style={{ marginTop: 10 }}>
+                            <summary style={{ fontSize: 11, color: colors.primary.darker, cursor: 'pointer', userSelect: 'none', fontWeight: 700 }}>Why this report score was given</summary>
+                            <div style={{ marginTop: 10, display: 'grid', gap: 10 }}>
+                              {scoreBand && (
+                                <div style={{ background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 8, padding: '10px 12px' }}>
+                                  <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>Why this exact score</div>
+                                  <div style={{ fontSize: 12, fontWeight: 700, color: colors.primary.darker }}>
+                                    Score {fieldForDisplay.score} sits in the {scoreBand.band} band, which maps to {scoreBand.label} in Salesforce.
+                                  </div>
+                                  <div style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 6, lineHeight: 1.6 }}>
+                                    {scoreBand.why}
+                                  </div>
+                                  {f.rationale && (
+                                    <div style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 6, lineHeight: 1.6 }}>
+                                      AI reasoning for this job: {fieldForDisplay.rationale}
+                                    </div>
+                                  )}
+                                  {reportEvidence.length > 0 && (
+                                    <div style={{ marginTop: 8, padding: '8px 10px', background: '#fff7ed', border: '1px solid #fdba74', borderRadius: 8 }}>
+                                      <div style={{ fontSize: 10, fontWeight: 700, color: '#9a3412', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>
+                                        Written report evidence affecting this score
+                                      </div>
+                                      {reportEvidence.map((item) => (
+                                        <div key={item} style={{ fontSize: 11, color: '#9a3412', marginTop: 4, lineHeight: 1.5 }}>
+                                          - {item}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                              <div style={{ fontSize: 11, color: colors.text.grayscale.body, lineHeight: 1.6 }}>{scoreGuideContent.report.purpose}</div>
+                              <div>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Evidence sources</div>
+                                {scoreGuideContent.report.evidence.map((item) => <div key={item} style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 4 }}>- {item}</div>)}
+                              </div>
+                              <div>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Scoring rubric</div>
+                                {scoreGuideContent.report.rubric.map((item) => <div key={item.band} style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 4 }}><strong>{item.band}:</strong> {item.meaning}</div>)}
+                              </div>
+                              <div>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Salesforce mapping</div>
+                                {scoreGuideContent.report.mapping.map((item) => <div key={item} style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 4 }}>{item}</div>)}
+                              </div>
+                              {f.salesforceValue && (
+                                <div style={{ background: '#f8fafc', borderRadius: 8, padding: '8px 10px', border: `1px solid ${colors.grayscale.border.subtle}` }}>
+                                  <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>Salesforce result for this job</div>
+                                  <div style={{ fontSize: 11, color: colors.text.grayscale.body }}>
+                                      The AI returned a score of {fieldForDisplay.score}, so the Salesforce picklist value is <strong>{fieldForDisplay.salesforceValue}</strong>.
+                                  </div>
+                                </div>
+                              )}
+                              <div>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em' }}>AI review triggers</div>
+                                {scoreGuideContent.report.triggers.map((item) => <div key={item} style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 4 }}>- {item}</div>)}
+                              </div>
+                              <div style={{ fontSize: 11, color: '#0f766e', background: '#f0fdf4', borderRadius: 8, padding: '8px 10px' }}>{scoreGuideContent.report.note}</div>
+                            </div>
+                          </details>
+                        )}
+                        {key === 'timeTaken' && scoreGuideContent.timeTaken && (
+                          <details style={{ marginTop: 10 }}>
+                            <summary style={{ fontSize: 11, color: colors.primary.darker, cursor: 'pointer', userSelect: 'none', fontWeight: 700 }}>Why this time on site score was given</summary>
+                            <div style={{ marginTop: 10, display: 'grid', gap: 10 }}>
+                              {scoreBand && (
+                                <div style={{ background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 8, padding: '10px 12px' }}>
+                                  <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>Why this exact score</div>
+                                  <div style={{ fontSize: 12, fontWeight: 700, color: colors.primary.darker }}>
+                                    Score {fieldForDisplay.score} sits in the {scoreBand.band} band.
+                                  </div>
+                                  <div style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 6, lineHeight: 1.6 }}>
+                                    {missingTimeBenchmark
+                                      ? 'A benchmark is missing for this trade and job type, so Time on Site should be treated as review-led context rather than a confident pass/fail judgment.'
+                                      : scoreBand.why}
+                                  </div>
+                                  {f.rationale && (
+                                    <div style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 6, lineHeight: 1.6 }}>
+                                      AI reasoning for this job: {fieldForDisplay.rationale}
+                                    </div>
+                                  )}
+                                  {timeTakenEvidence.length > 0 && (
+                                    <div style={{ marginTop: 8, padding: '8px 10px', background: '#fff7ed', border: '1px solid #fdba74', borderRadius: 8 }}>
+                                      <div style={{ fontSize: 10, fontWeight: 700, color: '#9a3412', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>
+                                        Timing evidence affecting this score
+                                      </div>
+                                      {timeTakenEvidence.map((item) => (
+                                        <div key={item} style={{ fontSize: 11, color: '#9a3412', marginTop: 4, lineHeight: 1.5 }}>
+                                          - {item}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                              <div style={{ fontSize: 11, color: colors.text.grayscale.body, lineHeight: 1.6 }}>{scoreGuideContent.timeTaken.purpose}</div>
+                              <div>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Evidence sources</div>
+                                {scoreGuideContent.timeTaken.evidence.map((item) => <div key={item} style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 4 }}>- {item}</div>)}
+                              </div>
+                              <div>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Scoring rubric</div>
+                                {scoreGuideContent.timeTaken.rubric.map((item) => <div key={item.band} style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 4 }}><strong>{item.band}:</strong> {item.meaning}</div>)}
+                              </div>
+                              <div>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Salesforce mapping</div>
+                                {scoreGuideContent.timeTaken.mapping.map((item) => <div key={item} style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 4 }}>{item}</div>)}
+                              </div>
+                              {f.salesforceValue && (
+                                <div style={{ background: '#f8fafc', borderRadius: 8, padding: '8px 10px', border: `1px solid ${colors.grayscale.border.subtle}` }}>
+                                  <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>Salesforce result for this job</div>
+                                  <div style={{ fontSize: 11, color: colors.text.grayscale.body }}>
+                                    {missingTimeBenchmark
+                                      ? 'A benchmark is missing, so this field should be treated as a review-led timing assessment even if a provisional score was returned.'
+                                      : <>The AI returned a score of {fieldForDisplay.score}, so the Salesforce timing value is <strong>{fieldForDisplay.salesforceValue}</strong>.</>}
+                                  </div>
+                                </div>
+                              )}
+                              <div>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: colors.text.grayscale.caption, textTransform: 'uppercase', letterSpacing: '0.08em' }}>AI review triggers</div>
+                                {scoreGuideContent.timeTaken.triggers.map((item) => <div key={item} style={{ fontSize: 11, color: colors.text.grayscale.body, marginTop: 4 }}>- {item}</div>)}
+                              </div>
+                              <div style={{ fontSize: 11, color: '#0f766e', background: '#f0fdf4', borderRadius: 8, padding: '8px 10px' }}>{scoreGuideContent.timeTaken.note}</div>
                             </div>
                           </details>
                         )}
@@ -844,11 +1531,6 @@ function AppointmentDetailView({
             <div key={image.id} style={{ borderRadius: 10, overflow: 'hidden', cursor: 'pointer', border: `1px solid ${colors.grayscale.border.subtle}`, background: '#fff' }} onClick={() => setSelectedImage(image)}>
               <img src={`data:${image.contentType};base64,${image.base64}`} alt={image.title} style={{ width: '100%', height: 120, objectFit: 'cover', display: 'block' }} />
               <div style={{ padding: '6px 8px', fontSize: 10, color: colors.text.grayscale.caption, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', background: '#fff' }}>{image.title}</div>
-              {getImageDescription(image) && (
-                <div style={{ padding: '0 8px 10px', fontSize: 11, color: colors.text.grayscale.body, lineHeight: 1.5 }}>
-                  {getImageDescription(image)}
-                </div>
-              )}
             </div>
           ))}
         </div>
@@ -1011,19 +1693,21 @@ export default function Dashboard() {
       { label: 'Signature', weight: '5%', field: tqrFields?.customerSignature, fallback: '' },
     ]
 
-    const fieldHtml = tqrCards.map(({ label, weight, field, fallback }) => `
-      <div class="score-card">
-        <div class="score-head">
-          <div>
-            <div class="score-title">${escapeHtml(label)}</div>
-            <div class="score-weight">Weight: ${escapeHtml(weight)}</div>
+      const fieldHtml = tqrCards.map(({ label, weight, field, fallback }) => {
+        const displayOutcome = field ? getDisplayOutcomeForField(field) : 'Pending'
+        return `
+        <div class="score-card">
+          <div class="score-head">
+            <div>
+              <div class="score-title">${escapeHtml(label)}</div>
+              <div class="score-weight">Weight: ${escapeHtml(weight)}</div>
           </div>
           <div class="score-value">${escapeHtml(field?.score ?? field?.value ?? fallback)}</div>
         </div>
-        <div class="score-meta">${escapeHtml(field?.outcome || 'Pending')}${field?.salesforceValue ? ` - ${escapeHtml(field.salesforceValue)}` : ''}</div>
-        <div class="score-text">${escapeHtml(field?.rationale || '')}</div>
-      </div>
-    `).join('')
+          <div class="score-meta">${escapeHtml(displayOutcome)}${field?.salesforceValue ? ` - ${escapeHtml(field.salesforceValue)}` : ''}</div>
+          <div class="score-text">${escapeHtml(field?.rationale || '')}</div>
+        </div>
+      `}).join('')
 
     const imagesHtml = workOrderImages.length > 0
       ? workOrderImages.map((image) => `
@@ -1033,6 +1717,14 @@ export default function Dashboard() {
           </div>
         `).join('')
       : '<div class="empty">No job photos available.</div>'
+    const documentsHtml = (appointment.documents || []).length > 0
+      ? (appointment.documents || []).map((doc) => `
+          <div style="padding:12px 14px;border:1px solid #e9d5ff;border-radius:10px;background:#faf5ff">
+            <div style="font-size:13px;font-weight:700;color:#1A1D23">${escapeHtml(doc.title)}</div>
+            <div style="font-size:11px;color:#646F86;margin-top:4px;text-transform:capitalize">${escapeHtml(doc.category || 'document')}${doc.fileType ? ` - ${escapeHtml(doc.fileType)}` : ''}${doc.source ? ` - ${escapeHtml(doc.source)}` : ''}</div>
+          </div>
+        `).join('')
+      : '<div class="empty">No invoice, payment, or service report documents found.</div>'
 
     const html = `
       <!doctype html>
@@ -1076,7 +1768,7 @@ export default function Dashboard() {
             <div style="font-size:28px;font-weight:800;margin-top:8px">${escapeHtml(appointment.AppointmentNumber || '')}</div>
             <div class="hero-grid">
               <div><div class="label" style="color:rgba(255,255,255,0.65)">Customer</div><div class="value">${escapeHtml(appointment.account?.Name)}</div></div>
-              <div><div class="label" style="color:rgba(255,255,255,0.65)">Engineer</div><div class="value">${escapeHtml(appointment.Allocated_Engineer__c)}</div></div>
+              <div><div class="label" style="color:rgba(255,255,255,0.65)">Engineer</div><div class="value">${escapeHtml(appointment.AllocatedEngineerName || '')}</div></div>
               <div><div class="label" style="color:rgba(255,255,255,0.65)">Work Type</div><div class="value">${escapeHtml(appointment.workOrder?.WorkType?.Name || appointment.Scheduled_Trade__c)}</div></div>
               <div><div class="label" style="color:rgba(255,255,255,0.65)">Actual End</div><div class="value">${escapeHtml(appointment.ActualEndTimeFormatted)}</div></div>
               <div><div class="label" style="color:rgba(255,255,255,0.65)">Work Order</div><div class="value">${escapeHtml(workOrderLabel)}</div></div>
@@ -1104,7 +1796,7 @@ export default function Dashboard() {
               <div><div class="label">Scheduled Trade</div><div class="value">${escapeHtml(appointment.Scheduled_Trade__c)}</div></div>
               <div><div class="label">Trade Group</div><div class="value">${escapeHtml(getTradeGroupLabel(appointment))}</div></div>
               <div><div class="label">Sector Type</div><div class="value">${escapeHtml(appointment.Sector_Type__c)}</div></div>
-              <div><div class="label">Allocated Engineer</div><div class="value">${escapeHtml(appointment.Allocated_Engineer__c)}</div></div>
+              <div><div class="label">Allocated Engineer</div><div class="value">${escapeHtml(appointment.AllocatedEngineerName || '')}</div></div>
               <div><div class="label">Scheduled Start</div><div class="value">${escapeHtml(appointment.SchedStartTimeFormatted)}</div></div>
               <div><div class="label">Arrival Window</div><div class="value">${escapeHtml(appointment.ArrivalWindowStartTimeFormatted)}</div></div>
               <div><div class="label">Actual End</div><div class="value">${escapeHtml(appointment.ActualEndTimeFormatted)}</div></div>
@@ -1118,11 +1810,21 @@ export default function Dashboard() {
 
           <div class="section">
             <div class="section-title">Engineer Job Report</div>
+            <div class="grid" style="grid-template-columns:repeat(2,minmax(0,1fr));margin-bottom:16px">
+              <div><div class="label">Actual Start</div><div class="value">${escapeHtml(getStartTimeLabel(appointment) || '')}</div></div>
+              <div><div class="label">Actual End</div><div class="value">${escapeHtml(appointment.ActualEndTimeFormatted || '')}</div></div>
+            </div>
             <div class="grid" style="grid-template-columns:repeat(3,minmax(0,1fr))">
+              <div><div class="label">Attendance Notes for Office</div><div class="value">${escapeHtml(appointment.Attendance_Notes_for_Office__c || '')}</div></div>
               <div><div class="label">Attendance Report</div><div class="value">${escapeHtml(appointment.Attendance_Report_for_Customer__c)}</div></div>
               <div><div class="label">Feedback Notes</div><div class="value">${escapeHtml(appointment.Feedback_Notes__c)}</div></div>
               <div><div class="label">Description</div><div class="value">${escapeHtml(appointment.Description)}</div></div>
             </div>
+          </div>
+
+          <div class="section">
+            <div class="section-title">Related Documents</div>
+            <div class="grid" style="grid-template-columns:1fr">${documentsHtml}</div>
           </div>
 
           <div class="section">

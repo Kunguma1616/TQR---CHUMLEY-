@@ -823,6 +823,7 @@ function AppointmentDetailView({
 }) {
   const lastFetchedId = useRef<string | null>(null)
   const [selectedImage, setSelectedImage] = useState<WorkOrderImage | null>(null)
+  const [imageDescriptionOverrides, setImageDescriptionOverrides] = useState<Record<string, string>>({})
 
   useEffect(() => {
     const wid = appointment?.workOrderId
@@ -831,6 +832,39 @@ function AppointmentDetailView({
       onOpenWorkOrder(wid)
     }
   }, [appointment?.workOrderId])
+
+  const needsFreshImageDescription = (description?: string | null) =>
+    !description
+    || /could not be generated/i.test(description)
+    || /run or re-run/i.test(description)
+
+  useEffect(() => {
+    const workOrderId = appointment?.workOrderId
+    const image = selectedImage
+    if (!workOrderId || !image) return
+    const cachedDescription =
+      imageDescriptionOverrides[image.id]
+      || (tqrResult?.image_descriptions || []).find((item) => item.id === image.id || item.title === image.title)?.description
+      || null
+    if (!needsFreshImageDescription(cachedDescription)) return
+
+    let cancelled = false
+    ;(async () => {
+      try {
+        const { data } = await api.get(`/api/work-orders/${workOrderId}/images/${image.id}/describe`)
+        const description = String(data?.description || '').trim()
+        if (!cancelled && description) {
+          setImageDescriptionOverrides((prev) => ({ ...prev, [image.id]: description }))
+        }
+      } catch {
+        // Leave the existing fallback text in place if live description fails.
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [appointment?.workOrderId, selectedImage, tqrResult, imageDescriptionOverrides])
 
   if (!appointment) return <div style={{ ...cardStyle, padding: 32 }}>Loading...</div>
 
@@ -867,7 +901,9 @@ function AppointmentDetailView({
     window.open(`${base}/api/content/${doc.id}?inline=true`, '_blank', 'noopener,noreferrer')
   }
   const getImageDescription = (image: WorkOrderImage) =>
-    imageDescriptions.find((item) => item.id === image.id || item.title === image.title)?.description || null
+    imageDescriptionOverrides[image.id]
+    || imageDescriptions.find((item) => item.id === image.id || item.title === image.title)?.description
+    || null
   const startScoreGuide = () => {
     const tour = driver({
       showProgress: true,
@@ -1515,6 +1551,70 @@ function AppointmentDetailView({
                     </div>
                   )
                 })}
+                {/* 8th card — Overall Result + Salesforce TQR Check fields */}
+                {(() => {
+                  const f = tqrResult.tqr_fields
+                  const imgSf = (f?.imagesQuality?.salesforceValue || '').toLowerCase()
+                  const imagesQualityOut = ['perfect', 'good', 'acceptable'].includes(imgSf) ? 'Good'
+                    : ['non acceptable', 'urgent issue', 'poor'].includes(imgSf) ? 'Poor'
+                    : imgSf ? 'N/A' : '—'
+                  const _sig = f?.customerSignature
+                  const _sigOutcome = (_sig?.outcome || '').toLowerCase()
+                  const _sigValue = (_sig?.value || _sig?.salesforceValue || '').toLowerCase()
+                  const signedOut = (_sigOutcome === 'pass' || _sigValue === 'yes' || _sigValue === 'na_customernotpresent') ? 'Yes' : 'No'
+                  const payVal = f?.paymentAttempted?.value || ''
+                  const payOut = payVal === 'CreditAccount' ? 'Credit Account' : payVal || '—'
+
+                  const sfRows: { label: string; value: string | undefined }[] = [
+                    { label: 'Post Visit Report Check',   value: tqrResult.verdict },
+                    { label: 'Images Quality',            value: imagesQualityOut },
+                    { label: 'Did the Customer Sign SR?', value: signedOut },
+                    { label: 'Time Taken',                value: f?.timeTaken?.salesforceValue },
+                    { label: 'Workmanship',               value: f?.workmanship?.salesforceValue },
+                    { label: 'DecisionMaking',            value: f?.decisionMaking?.salesforceValue },
+                    { label: 'Report',                    value: f?.report?.salesforceValue },
+                    { label: 'Payment Attempted',         value: payOut },
+                  ]
+
+                  const sfColor = (val: string | undefined) => {
+                    if (!val) return colors.text.grayscale.caption
+                    const v = val.toLowerCase()
+                    if (['tqr', 'perfect', 'good', 'yes', 'ideal'].some(k => v.includes(k))) return '#16a34a'
+                    if (['unacceptable', 'urgent issue', 'non acceptable', 'poor', 'excessive', 'rushed'].some(k => v.includes(k))) return '#dc2626'
+                    if (['sub standard', 'acceptable', 'n/a', 'credit account', 'no'].some(k => v.includes(k))) return '#d97706'
+                    return colors.text.grayscale.body
+                  }
+
+                  return (
+                    <div style={{ border: `2px solid ${verdictBg}`, borderRadius: 12, overflow: 'hidden', background: '#fff' }}>
+                      {/* Header */}
+                      <div style={{ background: verdictBg, padding: '12px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <div>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: '#fff' }}>Overall Result</div>
+                          <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.75)', marginTop: 1 }}>Final TQR Score</div>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                          <span style={{ fontSize: 22, fontWeight: 800, color: '#fff' }}>{tqrResult.overall}</span>
+                          <span style={{ fontSize: 11, fontWeight: 700, color: verdictBg, background: '#fff', padding: '2px 10px', borderRadius: 20 }}>{tqrResult.verdict}</span>
+                        </div>
+                      </div>
+                      {/* Salesforce TQR Check fields */}
+                      <div style={{ padding: '8px 0' }}>
+                        {sfRows.map(({ label, value }) => (
+                          <div key={label} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 14px', borderBottom: `1px solid ${colors.grayscale.border.subtle}` }}>
+                            <div style={{ fontSize: 11, color: colors.text.grayscale.caption, fontWeight: 500 }}>{label}</div>
+                            <div style={{ fontSize: 12, fontWeight: 800, color: sfColor(value) }}>{value || '—'}</div>
+                          </div>
+                        ))}
+                        {tqrResult.hard_fail && (
+                          <div style={{ margin: '8px 12px 4px', background: '#fef2f2', border: '1px solid #fecaca', color: '#dc2626', fontSize: 11, fontWeight: 700, padding: '6px 10px', borderRadius: 6 }}>
+                            ⛔ Hard Fail Triggered
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })()}
               </div>
             </div>
           )

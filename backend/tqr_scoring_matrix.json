@@ -1,0 +1,376 @@
+{
+  "models": {
+    "rubric_scoring_model": "openai/gpt-oss-120b",
+    "image_vision_model": "meta-llama/llama-4-scout-17b-16e-instruct"
+  },
+  "core_principles": [
+    "HUMAN AUTHORITY. A human trade manager is always the final decision maker.",
+    "EVIDENCE-FIRST. Every score must be justified by specific evidence from the job record.",
+    "EXPLICIT REASONING. Every numeric field must explain what would increase or decrease the score.",
+    "NO MIDDLE BIAS. If evidence is missing or ambiguous, use Review rather than guessing a middle score.",
+    "CONSERVATIVE ON SUBJECTIVE JUDGMENTS. Bias toward Good rather than Perfect for Workmanship and DecisionMaking.",
+    "URGENT ISSUE HANDLING. Safety concern or damage must surface as urgent issue with a 0-2 score.",
+    "STRUCTURED OUTPUT ONLY. Return a single valid JSON object and do not add prose outside it.",
+    "NO ENGINEER BIAS. Scores must be based only on evidence from this job."
+  ],
+  "summary_verdict": {
+    "hard_fail_triggers": [
+      "Zero photos attached to the job",
+      "Urgent Issue flag on Workmanship or DecisionMaking",
+      "Customer signature missing with no documented reason for absence",
+      "Job notes contain an unresolved flag or complaint that was not followed up"
+    ],
+    "weights": {
+      "workmanship": 0.2,
+      "decisionMaking": 0.2,
+      "imagesQuality": 0.2,
+      "report": 0.15,
+      "timeTaken": 0.1,
+      "paymentAttempted": 0.1,
+      "customerSignature": 0.05
+    },
+    "thresholds": {
+      "tqr": 80,
+      "subStandard": 50
+    }
+  },
+  "fields": {
+    "customerSignature": {
+      "purpose": "Confirms either that the customer signed the Service Report or that a legitimate reason exists for the absence of a signature.",
+      "type": "categorical",
+      "evidenceSources": [
+        "Signature image or data on the service report",
+        "Job notes for explanations of customer absence",
+        "Actual end time versus customer contact details"
+      ],
+      "salesforceMapping": [
+        "Signature present and legible = Yes",
+        "No signature and no documented reason = No",
+        "No signature but notes confirm customer absence = NA_CustomerNotPresent"
+      ],
+      "reviewTriggers": [
+        "Signature image exists but is illegible or ambiguous",
+        "Notes mention the customer but it is unclear whether they were present",
+        "Customer not present is claimed but other evidence suggests they were present"
+      ]
+    },
+    "imagesQuality": {
+      "purpose": "Assesses whether photographic evidence of the job is complete, relevant, and of sufficient quality to document what was done.",
+      "type": "numeric",
+      "evidenceSources": [
+        "All images attached to the service appointment",
+        "Trade group and job type",
+        "Job description"
+      ],
+      "mandatoryPhotos": [
+        "Location",
+        "Work before",
+        "Work after",
+        "Job completion"
+      ],
+      "situationalPhotos": [
+        "Work during",
+        "Workmanship picture",
+        "Protection used"
+      ],
+      "rubric": [
+        {
+          "band": "9-10",
+          "label": "Excellent",
+          "meaning": "All four mandatory photos present with excellent quality. All applicable situational photos present with good quality. No coverage gaps."
+        },
+        {
+          "band": "7-8",
+          "label": "Good",
+          "meaning": "All four mandatory photos present with good quality. Most applicable situational photos present. Minor quality or coverage gaps only."
+        },
+        {
+          "band": "5-6",
+          "label": "Adequate",
+          "meaning": "All four mandatory photos present but one or more has quality issues. Some applicable situational photos missing."
+        },
+        {
+          "band": "3-4",
+          "label": "Below standard",
+          "meaning": "One mandatory photo missing, or multiple mandatory photos with significant quality issues."
+        },
+        {
+          "band": "0-2",
+          "label": "Fail",
+          "meaning": "Multiple mandatory photos missing, or zero photos attached to the job."
+        }
+      ],
+      "salesforceMapping": [
+        "7-10 = Good",
+        "0-6 = Poor"
+      ],
+      "reviewTriggers": [
+        "Photos present but AI cannot determine subject clearly",
+        "Photos appear to be duplicates rather than progression shots",
+        "Situational photo appears missing but applicability is unclear",
+        "Photo metadata suggests images were taken significantly before or after job times"
+      ],
+      "validationRules": [
+        "A job with only 1, 2, or 3 of the 4 mandatory photos cannot score above 4.",
+        "A job with multiple mandatory photos missing must score 0-2.",
+        "A job with all 4 mandatory photos may score above 4 depending on quality and situational coverage."
+      ]
+    },
+    "paymentAttempted": {
+      "purpose": "Confirms that payment was collected at the appropriate time, or that a legitimate reason exists for non-collection.",
+      "type": "categorical",
+      "evidenceSources": [
+        "Invoice record on the job",
+        "Account Type on the customer record",
+        "Job notes for payment context",
+        "Charge Total Incl. VAT and payment gateway records"
+      ],
+      "salesforceMapping": [
+        "Invoice raised and payment recorded = Yes",
+        "Invoice raised and payment not collected on a cash account = No",
+        "Customer has Credit Account type on record = CreditAccount"
+      ],
+      "reviewTriggers": [
+        "Invoice exists but payment status is inconsistent with account type",
+        "Notes mention a payment dispute or refusal that was not resolved",
+        "Charge Total is 0 but the job appears billable",
+        "Account Type is blank or unusual",
+        "No invoice or payment evidence is visible for a chargeable job"
+      ]
+    },
+    "report": {
+      "purpose": "Assesses whether the written record is detailed enough for someone unfamiliar with the job to understand what was found, what was done, what parts were used, and what needs to happen next.",
+      "type": "numeric",
+      "evidenceSources": [
+        "Job description and notes field",
+        "Attendance Report for Customer",
+        "Parts and materials listed",
+        "Comments for Projected Difference",
+        "Reason for Projected Difference"
+      ],
+      "rubric": [
+        {
+          "band": "9-10",
+          "label": "Excellent",
+          "meaning": "Clear problem statement, complete work summary, all parts listed, explicit next steps where applicable. A future engineer could fully understand what happened."
+        },
+        {
+          "band": "7-8",
+          "label": "Good",
+          "meaning": "Clear problem and work summary. One minor element missing or thin."
+        },
+        {
+          "band": "5-6",
+          "label": "Adequate",
+          "meaning": "Describes what was done but is thin on detail, context, or diagnosis reasoning."
+        },
+        {
+          "band": "3-4",
+          "label": "Below standard",
+          "meaning": "One-line report, major structural gaps, or repeated template text without job-specific content."
+        },
+        {
+          "band": "0-2",
+          "label": "Fail",
+          "meaning": "Notes absent, incomprehensible, or effectively just copy the booking notes."
+        }
+      ],
+      "salesforceMapping": [
+        "9-10 = Perfect",
+        "7-8 = Good",
+        "5-6 = Acceptable",
+        "0-4 = Non Acceptable"
+      ],
+      "reviewTriggers": [
+        "Notes contain a flag, claim, or complaint that appears unresolved",
+        "Notes mention a scope change, customer disagreement, or site issue without resolution",
+        "Template or boilerplate language appears instead of job-specific detail",
+        "Parts listed do not match what was described"
+      ]
+    },
+    "timeTaken": {
+      "purpose": "Assesses whether time spent on site was appropriate for the work completed.",
+      "type": "numeric",
+      "evidenceSources": [
+        "Actual Start time",
+        "Actual End time",
+        "Trade group and scheduled trade",
+        "Job description",
+        "Industry benchmarks",
+        "Historical company benchmarks"
+      ],
+      "rubric": [
+        {
+          "band": "9-10",
+          "label": "Ideal",
+          "meaning": "Within 10% of expected time for the specific trade and job type."
+        },
+        {
+          "band": "7-8",
+          "label": "Good",
+          "meaning": "Within 25% of expected time."
+        },
+        {
+          "band": "5-6",
+          "label": "Adequate",
+          "meaning": "Within 50% of expected time."
+        },
+        {
+          "band": "3-4",
+          "label": "Concerning",
+          "meaning": "Outside 50% range."
+        },
+        {
+          "band": "0-2",
+          "label": "Extreme outlier",
+          "meaning": "Dramatic over- or under-run."
+        }
+      ],
+      "salesforceMapping": [
+        "7-10 = Ideal",
+        "3-6 over expected = Excessive",
+        "3-6 under expected = Rushed",
+        "0-2 over expected = Excessive (severe)",
+        "0-2 under expected = Rushed (severe)"
+      ],
+      "reviewTriggers": [
+        "No benchmark exists for this trade and job type",
+        "Job type is bespoke or unusual",
+        "Extreme outlier in either direction",
+        "Actual times appear inconsistent"
+      ]
+    },
+    "workmanship": {
+      "purpose": "Assesses the quality of the physical work performed, based on the photographic and written evidence in the job record.",
+      "type": "numeric",
+      "evidenceSources": [
+        "Before and after photos",
+        "Workmanship close-up photos",
+        "Parts and materials used",
+        "Job description and engineer notes",
+        "Flags or concerns raised in notes",
+        "Customer signature and comments"
+      ],
+      "rubric": [
+        {
+          "band": "9-10",
+          "label": "Excellent",
+          "meaning": "Before and after photos clearly document the work. Professional standard, clean finish, correct materials, no visible concerns."
+        },
+        {
+          "band": "7-8",
+          "label": "Good",
+          "meaning": "Work completed to a good standard. Minor documentation gaps or small finish imperfections that do not affect function."
+        },
+        {
+          "band": "5-6",
+          "label": "Acceptable",
+          "meaning": "Work completed, but evidence suggests rushing, sub-optimal material choice, or cosmetic issues."
+        },
+        {
+          "band": "3-4",
+          "label": "Non Acceptable",
+          "meaning": "Work appears incomplete, poor finish quality visible, inappropriate materials used, or workmanship falls short of competent."
+        },
+        {
+          "band": "0-2",
+          "label": "Urgent Issue",
+          "meaning": "Visible safety concern, damage caused, fundamentally incorrect approach, or remedial recall risk."
+        }
+      ],
+      "salesforceMapping": [
+        "9-10 = Perfect",
+        "7-8 = Good",
+        "5-6 = Acceptable",
+        "3-4 = Non Acceptable",
+        "0-2 = Urgent Issue"
+      ],
+      "reviewTriggers": [
+        "Insufficient photo evidence to judge workmanship at all",
+        "Photos suggest a quality issue but AI confidence is low",
+        "Visible damage, safety concern, inappropriate material, or unusual approach",
+        "Engineer notes flag an unresolved issue",
+        "Missing customer signature with thin documentation"
+      ],
+      "validationRules": [
+        "If no clear work-before photo exists, workmanship cannot score above 4.",
+        "If no clear work-after photo exists, workmanship cannot score above 4.",
+        "If both work-before and work-after photos are missing, workmanship should fall in the 0-4 band and surface for fail/review attention."
+      ]
+    },
+    "decisionMaking": {
+      "purpose": "Assesses the quality of judgment calls the engineer made during the visit.",
+      "type": "numeric",
+      "evidenceSources": [
+        "Job description",
+        "Parts used",
+        "Further works records",
+        "Quotes generated",
+        "Scope-change notes",
+        "Customer interactions in notes",
+        "Time Taken signal"
+      ],
+      "rubric": [
+        {
+          "band": "9-10",
+          "label": "Excellent",
+          "meaning": "Correct diagnosis, appropriate approach, opportunities captured, and strong expectation management."
+        },
+        {
+          "band": "7-8",
+          "label": "Good",
+          "meaning": "Sound decisions throughout. Minor opportunity potentially missed, but nothing materially wrong."
+        },
+        {
+          "band": "5-6",
+          "label": "Acceptable",
+          "meaning": "Adequate decisions overall, but a value-add opportunity was passed on or the approach was sub-optimal."
+        },
+        {
+          "band": "3-4",
+          "label": "Non Acceptable",
+          "meaning": "Further works not raised, poor expectation management, or the wrong approach was taken."
+        },
+        {
+          "band": "0-2",
+          "label": "Urgent Issue",
+          "meaning": "Decision created actual risk, major escalation failure, or safety issue not raised."
+        }
+      ],
+      "salesforceMapping": [
+        "9-10 = Perfect",
+        "7-8 = Good",
+        "5-6 = Acceptable",
+        "3-4 = Non Acceptable",
+        "0-2 = Urgent Issue"
+      ],
+      "reviewTriggers": [
+        "Complex trade-specific judgment that AI cannot assess confidently",
+        "Scope change or customer issue requiring human interpretation",
+        "Repair-versus-replace decision not fully explained",
+        "Further works or quotes likely appropriate but not raised",
+        "Customer expectation may have been mismanaged"
+      ]
+    }
+  },
+  "output_schema_summary": {
+    "requiredFields": [
+      "score or categorical value",
+      "salesforceValue where applicable",
+      "outcome",
+      "confidence",
+      "evidenceCited",
+      "rationale",
+      "whatWouldIncrease and whatWouldDecrease for numeric fields",
+      "reviewReason when outcome is Review"
+    ],
+    "validationRules": [
+      "Reject if JSON is invalid",
+      "Reject if required fields are missing",
+      "Reject if score is outside 0-10",
+      "Reject if salesforceValue does not match the rubric band",
+      "Reject if evidenceCited is empty for Pass or Fail outcomes",
+      "Reject if confidence is outside 0.0-1.0"
+    ]
+  }
+}

@@ -939,10 +939,10 @@ export default function Dashboard() {
   }
 
   const navItems: Array<{ key: View; label: string }> = [
-    { key: 'dashboard', label: '🏠 Dashboard' },
-    { key: 'appointments', label: '📋 Appointments' },
-    { key: 'engineers', label: '👷 Engineers' },
-    { key: 'tqr-report', label: '✅ TQR Report' },
+    { key: 'dashboard', label: ' Dashboard' },
+    { key: 'appointments', label: 'Appointments' },
+    { key: 'engineers', label: 'Engineers' },
+    { key: 'tqr-report', label: 'TQR Report' },
   ]
 
   return (

@@ -9,9 +9,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-
 from PIL import Image
-
 import aiosqlite
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
@@ -46,6 +44,7 @@ DOCUMENT_CONTENT_TYPES = {
     "csv": "text/csv",
     "txt": "text/plain",
 }
+PROMPT_CONFIG_PATH = BASE_DIR / "tqr_scoring_matrix.json"
 
 APPOINTMENT_FIELDS = [
     "Id",
@@ -121,6 +120,18 @@ def safe_float(value: Any) -> float:
         return 0.0
 
 
+def _unique_strings(values: list[str | None]) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = str(value or "").strip()
+        if not item or item in seen:
+            continue
+        output.append(item)
+        seen.add(item)
+    return output
+
+
 def clean_record(record: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in record.items() if key != "attributes"}
 
@@ -133,6 +144,87 @@ def json_extract(raw: str | None) -> dict[str, Any]:
     if start == -1 or end == -1 or end <= start:
         raise ValueError("JSON object not found in AI response")
     return json.loads(raw[start : end + 1])
+
+
+def load_prompt_config() -> dict[str, Any]:
+    with open(PROMPT_CONFIG_PATH, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _format_bullets(items: list[str]) -> str:
+    return "\n".join(f"- {item}" for item in items)
+
+
+def build_tqr_system_prompt(config: dict[str, Any]) -> str:
+    fields = config["fields"]
+    sections: list[str] = [
+        "ROLE",
+        "You are a Trade Quality Review (TQR) scoring assistant for Chumley, a field service company.",
+        "Your task is to assess completed jobs against a documented rubric and produce per-field scores with cited evidence for review by a human trade manager.",
+        "",
+        "CORE PRINCIPLES",
+        _format_bullets(config["core_principles"]),
+        "",
+        "SUMMARY VERDICT RULES",
+        "Hard fail triggers:",
+        _format_bullets(config["summary_verdict"]["hard_fail_triggers"]),
+        "",
+        "OUTPUT DISCIPLINE",
+        _format_bullets(config["output_schema_summary"]["requiredFields"]),
+        "",
+        "VALIDATION RULES",
+        _format_bullets(config["output_schema_summary"]["validationRules"]),
+        "",
+        "FIELD INSTRUCTIONS"
+    ]
+    for field_name, field in fields.items():
+        sections.extend([
+            "",
+            f"FIELD {field_name}",
+            f"Purpose: {field['purpose']}",
+            "Evidence sources:",
+            _format_bullets(field.get("evidenceSources", [])),
+        ])
+        if field.get("mandatoryPhotos"):
+            sections.extend([
+                "Mandatory photos:",
+                _format_bullets(field["mandatoryPhotos"]),
+            ])
+        if field.get("situationalPhotos"):
+            sections.extend([
+                "Situational photos:",
+                _format_bullets(field["situationalPhotos"]),
+            ])
+        if field.get("rubric"):
+            rubric_lines = [f"{item['band']} {item['label']}: {item['meaning']}" for item in field["rubric"]]
+            sections.extend([
+                "Scoring rubric:",
+                _format_bullets(rubric_lines),
+            ])
+        if field.get("salesforceMapping"):
+            sections.extend([
+                "Salesforce mapping:",
+                _format_bullets(field["salesforceMapping"]),
+            ])
+        if field.get("reviewTriggers"):
+            sections.extend([
+                "AI review triggers:",
+                _format_bullets(field["reviewTriggers"]),
+            ])
+        if field.get("validationRules"):
+            sections.extend([
+                "Field validation rules:",
+                _format_bullets(field["validationRules"]),
+            ])
+    sections.extend([
+        "",
+        "IMPORTANT",
+        "- Do not hallucinate missing evidence.",
+        "- Understand the image evidence in practical detail before scoring.",
+        "- If evidence is missing or ambiguous, prefer Review over an unjustified passing score.",
+        "- Your response must be a single valid JSON object with a top-level 'fields' object and 'summary' object."
+    ])
+    return "\n".join(sections)
 
 
 def create_salesforce_client() -> Salesforce:
@@ -180,6 +272,11 @@ async def lifespan(app: FastAPI):
     await init_db()
     app.state.sf = await run_in_threadpool(create_salesforce_client)
     app.state.groq = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    app.state.prompt_config = load_prompt_config()
+    app.state.tqr_system_prompt = build_tqr_system_prompt(app.state.prompt_config)
+    app.state.rubric_scoring_model = app.state.prompt_config.get("models", {}).get("rubric_scoring_model", "openai/gpt-oss-120b")
+    app.state.image_vision_model = "meta-llama/llama-4-scout-17b-16e-instruct"
+    app.state.image_vision_models = ["meta-llama/llama-4-scout-17b-16e-instruct"]
     log.info("App started — Salesforce + Groq clients ready")
     yield
 
@@ -466,6 +563,9 @@ def classify_document(title: str, file_type: str, source_label: str) -> str:
     if "payment" in blob or "receipt" in blob:
         return "payment"
     if "service report" in blob or "service_report" in blob or "customer service report" in blob:
+        return "service-report"
+    # SA-XXXXXX pattern documents are service reports that typically contain customer signatures
+    if re.search(r'\bsa[-_]\d+', title.lower()):
         return "service-report"
     return "document"
 
@@ -773,9 +873,10 @@ OUTPUT SCHEMA - return exactly this JSON structure:
 
 FIELD INSTRUCTIONS:
 
-FIELD customerSignature: Check signature.present. If true and clear = Yes/Pass. If false, scan notes for
-"customer not present", "no-one at property", "access via key" etc = NA_CustomerNotPresent/Pass.
-If false and no explanation = No/Fail (hard fail trigger).
+FIELD customerSignature: Check signature.present first. If true = Yes/Pass.
+If false, check signature.hasServiceReportDocument — if a service report document is attached (e.g. SA-XXXXXX PDF), the customer signature is likely contained within that document and should be treated as Yes/Pass.
+If false and no service report document, scan notes for "customer not present", "no-one at property", "access via key" etc = NA_CustomerNotPresent/Pass.
+Only score No/Fail (hard fail trigger) if signature.present is false AND signature.hasServiceReportDocument is false AND there is no valid explanation in the notes.
 
 FIELD imagesQuality:
 Purpose:
@@ -947,27 +1048,21 @@ the engineer report rather than pretending certainty where the evidence is thin.
 def _compute_weighted_verdict(
     fields: dict[str, Any],
     appointment_number: str = "UNKNOWN",
+    photo_count: int = 0,
 ) -> tuple[float, str, bool, list[str]]:
     prefix = f"[TQR:{appointment_number}]"
     hard_fail_reasons: list[str] = []
 
     # --- Hard fail checks ---
     img = fields.get("imagesQuality") or {}
-    mandatory = img.get("mandatoryPhotosPresent") or {}
     img_score = safe_float(img.get("score", 0))
 
-    if not any(mandatory.values()):
+    if photo_count == 0:
         reason = "Zero photos attached"
         hard_fail_reasons.append(reason)
         log.warning("%s HARD FAIL → %s", prefix, reason)
-
-    # FIX 2: score of 0-4 on images is also a hard fail
-    elif img_score <= 4:
-        reason = f"Image quality critically low (score={img_score}/10) — mandatory photos missing"
-        hard_fail_reasons.append(reason)
-        log.warning("%s HARD FAIL → %s", prefix, reason)
     else:
-        log.info("%s Image Quality score=%s/10 — OK", prefix, img_score)
+        log.info("%s Image Quality score=%s/10  photo_count=%d — OK", prefix, img_score, photo_count)
 
     if (fields.get("workmanship") or {}).get("urgentIssueDetected"):
         reason = "Urgent workmanship issue detected"
@@ -979,13 +1074,26 @@ def _compute_weighted_verdict(
         hard_fail_reasons.append(reason)
         log.warning("%s HARD FAIL → %s", prefix, reason)
 
-    sig_value = (fields.get("customerSignature") or {}).get("value", "No")
-    if sig_value == "No":
+    sig_obj = fields.get("customerSignature") or {}
+    sig_value = (sig_obj.get("value") or "").strip()
+    sig_outcome = (sig_obj.get("outcome") or "").lower().strip()
+    sig_sf_val = (sig_obj.get("salesforceValue") or "").lower().strip()
+    has_sig_doc = bool(sig_obj.get("hasServiceReportDocument"))
+    sig_pass = (
+        sig_outcome in ("pass", "yes", "na_customernotpresent")
+        or sig_sf_val in ("yes", "na_customernotpresent")
+        or sig_value in ("Yes", "NA_CustomerNotPresent")
+        or has_sig_doc
+    )
+    if not sig_pass:
         reason = "Customer signature missing with no valid reason"
         hard_fail_reasons.append(reason)
         log.warning("%s HARD FAIL → %s", prefix, reason)
     else:
-        log.info("%s Customer signature = %s — OK", prefix, sig_value)
+        log.info(
+            "%s Customer signature OK (outcome=%s, value=%r, sfVal=%s, hasDoc=%s)",
+            prefix, sig_outcome, sig_value, sig_sf_val, has_sig_doc,
+        )
 
     if (fields.get("report") or {}).get("flaggedIssues"):
         reason = "Unresolved customer complaint in report"
@@ -995,9 +1103,18 @@ def _compute_weighted_verdict(
     hard_fail = bool(hard_fail_reasons)
 
     # --- Score calculation ---
-    sig_score = {"Yes": 10, "NA_CustomerNotPresent": 10, "No": 0}.get(sig_value, 5)
-    pay_value = (fields.get("paymentAttempted") or {}).get("value", "No")
-    pay_score = {"Yes": 10, "CreditAccount": 10, "No": 0}.get(pay_value, 5)
+    # Respect AI outcome=Pass; only map to 0 when clearly No
+    sig_score = 10 if sig_pass else 0
+    pay_obj = fields.get("paymentAttempted") or {}
+    pay_value = pay_obj.get("value", "No")
+    pay_outcome = (pay_obj.get("outcome") or "").lower()
+    pay_pass = pay_outcome == "pass" or pay_value in ("Yes", "CreditAccount")
+    if pay_pass:
+        pay_score = 10
+    elif pay_value == "No":
+        pay_score = 0
+    else:
+        pay_score = safe_float(pay_obj.get("score", 5))
 
     log.info("%s Signature value=%s → score=%s/10 (weight 5%%)", prefix, sig_value, sig_score)
     log.info("%s Payment value=%s → score=%s/10 (weight 10%%)", prefix, pay_value, pay_score)
@@ -1084,7 +1201,7 @@ def _build_verdict_summary(
     return f"{prefix} AI observations: {ai_observations}"
 
 
-def _compress_image_for_ai(img: dict[str, Any], max_px: int = 512, quality: int = 40) -> str:
+def _compress_image_for_ai(img: dict[str, Any], max_px: int = 1024, quality: int = 70) -> str:
     raw = base64.b64decode(img["base64"])
     with Image.open(io.BytesIO(raw)) as pil:
         pil = pil.convert("RGB")
@@ -1095,19 +1212,24 @@ def _compress_image_for_ai(img: dict[str, Any], max_px: int = 512, quality: int 
 
 
 IMAGE_DESCRIPTION_PROMPT = """
-You are inspecting a single field service job photo.
-Describe exactly what is visible in this image in clear practical detail.
-Focus on visible equipment, fittings, surfaces, tools, measurements, job progress, cleanliness, workmanship, and any obvious risks.
-Do not guess hidden context or invent anything that is not visible.
-Return ONLY valid JSON:
-{
-  "description": "Detailed visual description"
-}
+You are inspecting a single field service job photo for a UK-based trades company.
+Describe exactly what is visible in this image in clear, practical British English.
+Use British spelling and terminology throughout (e.g. colour, taps, plasterboard, skirting board, bin, spanner, worktop).
+
+STRICT ACCURACY RULES — you must follow all of these:
+- Never name a specific tool or object unless you are certain. If you are not sure what something is, describe its shape, colour, size and markings instead (e.g. "a grey and yellow cylindrical object" NOT "a utility knife").
+- Do not assume what a handheld object is based on context alone. Describe what you literally see.
+- Only state what is clearly and unambiguously visible. Do not infer, guess or fill in gaps.
+- If an object could be several things, describe its visible features only — do not pick one and state it as fact.
+
+Focus on: equipment and tools present, fittings and fixtures, surfaces and materials, job progress, cleanliness, workmanship quality, and any obvious safety risks.
+Return a single plain paragraph only.
 """
 
 
 async def describe_single_image(image: dict[str, Any]) -> dict[str, Any]:
     client = app.state.groq
+    image_models = list(getattr(app.state, "image_vision_models", [])) or [app.state.image_vision_model]
     try:
         compressed = _compress_image_for_ai(image)
     except Exception:
@@ -1127,24 +1249,36 @@ async def describe_single_image(image: dict[str, Any]) -> dict[str, Any]:
             "image_url": {"url": f"data:image/jpeg;base64,{compressed}"},
         },
     ]
-    try:
-        response = await run_in_threadpool(
-            client.chat.completions.create,
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
-            temperature=0.1,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": IMAGE_DESCRIPTION_PROMPT},
-                {"role": "user", "content": content},
-            ],
-            max_tokens=500,
-        )
-        raw = response.choices[0].message.content or ""
-        payload = json_extract(raw)
-        description = str(payload.get("description") or "").strip() or "No description returned."
-        log.info("Image description generated for '%s' (%d chars)", image.get("title"), len(description))
-    except Exception as exc:
-        log.error("Image description failed for '%s': %s", image.get("title"), exc)
+    description = ""
+    last_error: Exception | None = None
+    for image_model in image_models:
+        try:
+            response = await run_in_threadpool(
+                client.chat.completions.create,
+                model=image_model,
+                temperature=0.1,
+                messages=[
+                    {"role": "system", "content": IMAGE_DESCRIPTION_PROMPT},
+                    {"role": "user", "content": content},
+                ],
+                max_tokens=500,
+            )
+            raw = response.choices[0].message.content or ""
+            if isinstance(raw, str):
+                description = raw.strip()
+                if description.startswith("{"):
+                    payload = json_extract(description)
+                    description = str(payload.get("description") or "").strip()
+            else:
+                description = str(raw).strip()
+            description = description or "No description returned."
+            log.info("Image description generated for '%s' using %s (%d chars)", image.get("title"), image_model, len(description))
+            break
+        except Exception as exc:
+            last_error = exc
+            log.warning("Image description attempt failed for '%s' using %s: %s", image.get("title"), image_model, exc)
+    if not description:
+        log.error("Image description failed for '%s' after trying %d model(s): %s", image.get("title"), len(image_models), last_error)
         description = "AI description could not be generated for this image."
     return {
         "id": image.get("id"),
@@ -1161,6 +1295,8 @@ async def run_tqr_analysis(
     documents: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     client = app.state.groq
+    tqr_system_prompt = app.state.tqr_system_prompt
+    rubric_scoring_model = app.state.rubric_scoring_model
     appt_num = appointment.get("AppointmentNumber", "UNKNOWN")
     prefix = f"[TQR:{appt_num}]"
 
@@ -1186,6 +1322,7 @@ async def run_tqr_analysis(
     documents = documents or []
     invoice_docs = [doc for doc in documents if doc.get("category") == "invoice"]
     payment_docs = [doc for doc in documents if doc.get("category") == "payment"]
+    service_report_docs = [doc for doc in documents if doc.get("category") == "service-report"]
 
     evidence = {
         "job": {
@@ -1215,7 +1352,9 @@ async def run_tqr_analysis(
             "hasPaymentDocument": bool(payment_docs),
         },
         "signature": {
-            "present": bool(appointment.get("Customer_Signature__c")),
+            "present": bool(appointment.get("Customer_Signature__c")) or bool(service_report_docs),
+            "hasServiceReportDocument": bool(service_report_docs),
+            "serviceReportDocuments": [doc.get("title") for doc in service_report_docs],
         },
         "workOrder": {
             "workOrderNumber": (work_order or {}).get("WorkOrderNumber"),
@@ -1233,40 +1372,24 @@ async def run_tqr_analysis(
         bool(appointment.get("Customer_Signature__c")),
     )
 
-    sample_images = images[:5]
-    compressed: list[tuple[dict[str, Any], str]] = []
-    for img in sample_images:
-        try:
-            b64 = _compress_image_for_ai(img)
-            compressed.append((img, b64))
-        except Exception as exc:
-            log.warning("%s Could not compress image '%s': %s", prefix, img.get("title"), exc)
+    log.info("%s Generating %d image description(s) for rubric scoring", prefix, len(images))
+    image_descriptions = await asyncio.gather(*(describe_single_image(img) for img in images))
+    evidence["imageDescriptions"] = image_descriptions
 
-    log.info("%s Sending %d/%d photos to Groq for TQR scoring", prefix, len(compressed), len(images))
-
-    content: list[dict[str, Any]] = [
-        {
-            "type": "text",
-            "text": (
-                f"Job Evidence (JSON):\n{json.dumps(evidence, indent=2)}\n\n"
-                f"Total photos on job: {len(images)}. Showing {len(compressed)} sample photo(s) below.\n\n"
-                "Assess this job against all 7 TQR fields. Return ONLY the JSON object matching the output schema."
-            ),
-        }
-    ]
-    for img, b64 in compressed:
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-        })
+    content = (
+        f"Job Evidence (JSON):\n{json.dumps(evidence, indent=2)}\n\n"
+        "Assess this job against all 7 TQR fields using the rubric exactly.\n"
+        "Use imageDescriptions and photo metadata as the source of image evidence.\n"
+        "Return ONLY the JSON object matching the output schema."
+    )
 
     response = await run_in_threadpool(
         client.chat.completions.create,
-        model="meta-llama/llama-4-scout-17b-16e-instruct",
+        model=rubric_scoring_model,
         temperature=0.1,
         response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": TQR_SYSTEM_PROMPT},
+            {"role": "system", "content": tqr_system_prompt},
             {"role": "user", "content": content},
         ],
         max_tokens=4000,
@@ -1310,11 +1433,9 @@ async def run_tqr_analysis(
     ai_observations = (payload.get("summary") or {}).get("overallObservations", "AI analysis completed.")
     log.info("%s Groq raw summary: %s", prefix, ai_observations[:200])
 
-    image_descriptions = await asyncio.gather(*(describe_single_image(img) for img in images))
-
     # Compute verdict AFTER AI runs so we can reconcile the summary
     overall_score, verdict, hard_fail, hard_fail_reasons = _compute_weighted_verdict(
-        fields, appointment_number=appt_num
+        fields, appointment_number=appt_num, photo_count=len(images)
     )
 
     # FIX 3: Build a summary that matches the verdict — never contradicts it
@@ -1422,6 +1543,15 @@ async def get_work_order_images(work_order_id: str):
     return {"images": await fetch_images_for_entity(work_order_id)}
 
 
+@app.get("/api/work-orders/{work_order_id}/images/{image_id}/describe")
+async def describe_work_order_image(work_order_id: str, image_id: str):
+    images = await fetch_images_for_entity(work_order_id)
+    image = next((item for item in images if item.get("id") == image_id), None)
+    if not image:
+        raise HTTPException(status_code=404, detail="Image not found")
+    return await describe_single_image(image)
+
+
 @app.get("/api/content/{version_id}")
 async def open_content(version_id: str, inline: bool = Query(True)):
     metadata = await fetch_content_version_by_id(version_id)
@@ -1439,6 +1569,202 @@ async def open_content(version_id: str, inline: bool = Query(True)):
         media_type=media_type,
         headers={"Content-Disposition": f'{disposition}; filename="{title}.{extension}"'},
     )
+
+
+
+_sf_label_to_api: dict[str, str] = {}        # label.lower() -> API name
+_sf_api_to_picklist: dict[str, list[str]] = {}  # API name -> valid picklist values
+
+
+async def _get_sa_field_map() -> dict[str, str]:
+    """Return label→API name map for ServiceAppointment, cached after first call."""
+    global _sf_label_to_api, _sf_api_to_picklist
+    if _sf_label_to_api:
+        return _sf_label_to_api
+    try:
+        sf = app.state.sf
+        meta = await run_in_threadpool(sf.ServiceAppointment.describe)
+        _sf_label_to_api = {
+            f["label"].lower(): f["name"]
+            for f in meta["fields"]
+            if f.get("updateable")
+        }
+        # Cache picklist values for every picklist/multipicklist field
+        for f in meta["fields"]:
+            if f.get("type") in ("picklist", "multipicklist") and f.get("picklistValues"):
+                _sf_api_to_picklist[f["name"]] = [v["value"] for v in f["picklistValues"] if v.get("active")]
+        log.info("[SF] Field map loaded: %d updateable fields on ServiceAppointment", len(_sf_label_to_api))
+        # Log picklist values for our TQR fields so we can verify exact strings
+        tqr_api_names = [
+            "Post_Visit_Report_Check__c", "Workmanship1__c", "Decision_Making1__c",
+            "Report__c", "Images_Provided__c", "Time_Taken__c", "Signed_SR__c",
+            "Payment_Attempted__c",
+        ]
+        for api in tqr_api_names:
+            vals = _sf_api_to_picklist.get(api, [])
+            log.info("[SF] Picklist %s → %s", api, vals)
+        # Log any field whose label contains "payment" to find the right one
+        payment_fields = [(lbl, nm) for lbl, nm in _sf_label_to_api.items() if "payment" in lbl]
+        log.info("[SF] Fields with 'payment' in label: %s", payment_fields)
+    except Exception as exc:
+        log.error("[SF] Could not load field map: %s", exc)
+    return _sf_label_to_api
+
+
+async def push_tqr_to_salesforce(appointment_id: str, result: dict[str, Any]) -> None:
+    sf = app.state.sf
+    field_map = await _get_sa_field_map()
+
+    fields = result.get("tqr_fields") or {}
+    verdict = result.get("verdict") or ""
+
+    def sf_val(key: str, sub: str = "salesforceValue") -> str | None:
+        return (fields.get(key) or {}).get(sub) or None
+
+    img_obj = fields.get("imagesQuality") or {}
+    img_sf = (img_obj.get("salesforceValue") or "").lower()
+    img_outcome = (img_obj.get("outcome") or "").lower()
+    if img_sf in ("good",) or (img_sf in ("perfect", "acceptable") and img_outcome not in ("fail", "review")):
+        images_quality = "Good"
+    elif img_sf in ("poor", "non acceptable", "urgent issue") or img_outcome == "fail":
+        images_quality = "Poor"
+    elif img_outcome == "review" or not img_sf:
+        images_quality = "NA"
+    else:
+        images_quality = None
+
+    sig_obj = fields.get("customerSignature") or {}
+    sig_outcome = (sig_obj.get("outcome") or "").lower().strip()
+    sig_value = (sig_obj.get("value") or "").lower().strip()
+    sig_sf_val = (sig_obj.get("salesforceValue") or "").lower().strip()
+    has_sig_doc = bool(sig_obj.get("hasServiceReportDocument"))
+    did_sign = "Yes" if (
+        sig_outcome in ("pass", "yes", "na_customernotpresent")
+        or sig_sf_val in ("yes", "na_customernotpresent")
+        or sig_value in ("yes", "na_customernotpresent")
+        or has_sig_doc
+    ) else "No"
+
+    pay_obj = fields.get("paymentAttempted") or {}
+    pay_raw = (pay_obj.get("value") or pay_obj.get("salesforceValue") or "").strip()
+    pay_outcome = (pay_obj.get("outcome") or "").lower()
+    if pay_raw == "CreditAccount" or "credit" in pay_raw.lower():
+        payment = "Credit Account"
+    elif pay_outcome == "pass" or pay_raw == "Yes":
+        payment = "Yes"
+    elif pay_raw == "No" or pay_outcome in ("fail",):
+        payment = "No"
+    else:
+        payment = None
+
+    # Normalise Time Taken — Salesforce only accepts "Excessive", "Ideal", "Rushed"
+    time_taken_raw = sf_val("timeTaken") or ""
+    time_taken = time_taken_raw.replace(" (severe)", "").strip() or None
+
+    # Keyed by Salesforce field label (lowercase) — we discover the API name at runtime
+    label_values: dict[str, Any] = {
+        "post visit report check":   verdict or None,
+        "workmanship":               sf_val("workmanship"),
+        "decisionmaking":            sf_val("decisionMaking"),
+        "report":                    sf_val("report"),
+        "images quality":            images_quality,
+        "time taken":                time_taken,
+        "did the customer sign sr?": did_sign,
+        "payment attempted":         payment,
+    }
+
+    log.info("[SF] Raw values to push: %s", label_values)
+
+    # Map labels → actual API field names using the discovered map
+    payload: dict[str, Any] = {}
+    missing: list[str] = []
+    for label, value in label_values.items():
+        if value is None:
+            continue
+        api_name = field_map.get(label)
+        if api_name:
+            # Validate against picklist if applicable
+            allowed = _sf_api_to_picklist.get(api_name, [])
+            if allowed and value not in allowed:
+                log.warning(
+                    "[SF] Picklist mismatch for %s (%s): value=%r not in %s — skipping",
+                    label, api_name, value, allowed,
+                )
+                continue
+            payload[api_name] = value
+        else:
+            missing.append(label)
+
+    if missing:
+        log.warning("[SF] Could not resolve API names for labels: %s", missing)
+        # Attempt direct API name lookup for known aliases
+        alias_map = {
+            "payment attempted": "Payment_Attempted__c",
+            "images quality": "Images_Provided__c",
+            "decisionmaking": "Decision_Making1__c",
+        }
+        for label in list(missing):
+            direct = alias_map.get(label)
+            if direct and label_values.get(label) is not None:
+                value = label_values[label]
+                allowed = _sf_api_to_picklist.get(direct, [])
+                if allowed and value not in allowed:
+                    log.warning("[SF] Alias picklist mismatch for %s: value=%r not in %s", label, value, allowed)
+                else:
+                    payload[direct] = value
+                    missing.remove(label)
+                    log.info("[SF] Resolved via alias: %s → %s = %r", label, direct, value)
+
+    if not payload:
+        log.error("[SF] Nothing to push — no field names could be resolved")
+        return
+
+    try:
+        await run_in_threadpool(sf.ServiceAppointment.update, appointment_id, payload)
+        log.info("[SF] ✓ Pushed to %s: %s", appointment_id, payload)
+    except Exception as exc:
+        log.error("[SF] ✗ Push failed for %s: %s | payload=%s", appointment_id, exc, payload)
+
+
+@app.get("/api/sf-fields/service-appointment")
+async def get_service_appointment_fields():
+    """Debug endpoint — returns all writable field names on ServiceAppointment."""
+    sf = app.state.sf
+    try:
+        meta = await run_in_threadpool(sf.ServiceAppointment.describe)
+        writable = [
+            {"name": f["name"], "label": f["label"], "type": f["type"]}
+            for f in meta["fields"]
+            if not f.get("calculated") and f.get("updateable")
+        ]
+        return {"fields": writable}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/sf-picklists/tqr-fields")
+async def get_tqr_picklist_values():
+    """Debug endpoint — returns allowed picklist values for each TQR Check field."""
+    field_map = await _get_sa_field_map()
+    tqr_labels = [
+        "post visit report check", "workmanship", "decisionmaking",
+        "report", "images quality", "time taken",
+        "did the customer sign sr?", "payment attempted",
+    ]
+    result = {}
+    for label in tqr_labels:
+        api_name = field_map.get(label)
+        if not api_name:
+            # Try alias
+            alias = {
+                "payment attempted": "Payment_Attempted__c",
+                "images quality": "Images_Provided__c",
+                "decisionmaking": "Decision_Making1__c",
+            }.get(label)
+            api_name = alias
+        allowed = _sf_api_to_picklist.get(api_name, []) if api_name else []
+        result[label] = {"api_name": api_name, "allowed_values": allowed}
+    return result
 
 
 @app.post("/api/analyse/{appointment_id}")
@@ -1463,6 +1789,7 @@ async def analyse_appointment(appointment_id: str, force: bool = Query(False)):
     result = await run_tqr_analysis(appointment, work_order, account, images, documents)
     saved = await save_analysis_result(appointment_id, result)
     log.info("[API] Analysis saved for %s — verdict=%s overall=%.2f", appointment_id, saved.get("verdict"), saved.get("overall", 0))
+    await push_tqr_to_salesforce(appointment_id, saved)
     return saved
 
 

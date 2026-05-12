@@ -6,23 +6,19 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime                           
 from pathlib import Path
 from typing import Any
 from PIL import Image
 import aiosqlite
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from groq import Groq
 from simple_salesforce import Salesforce
 
-
-# ---------------------------------------------------------------------------
-# Logging setup
-# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -50,6 +46,7 @@ APPOINTMENT_FIELDS = [
     "Id",
     "Trade_Group_Postcode__c",
     "Trade_Group_Region__c",
+    "Account_Type__c",
     "Allocated_Engineer__c",
     "Allocated_Engineer__r.Name",
     "Feedback_Notes__c",
@@ -89,7 +86,6 @@ BASE_APPOINTMENTS_SOQL = f"""
     FROM ServiceAppointment
     WHERE ActualEndTime >= LAST_N_DAYS:90
       AND Status = 'Visit Complete'
-      AND Post_Visit_Report_Check__c = null
       AND RecordType.Name = 'Service Appointment'
       AND (NOT Trade_Group_Postcode__c LIKE '%util%')
       AND (NOT Trade_Group_Postcode__c LIKE '%PM%')
@@ -119,7 +115,6 @@ def safe_float(value: Any) -> float:
     except (ValueError, TypeError):
         return 0.0
 
-
 def _unique_strings(values: list[str | None]) -> list[str]:
     output: list[str] = []
     seen: set[str] = set()
@@ -132,8 +127,78 @@ def _unique_strings(values: list[str | None]) -> list[str]:
     return output
 
 
+def salesforce_record_url(record_id: str | None) -> str | None:
+    if not record_id:
+        return None
+    sf = getattr(app.state, "sf", None)
+    instance = getattr(sf, "sf_instance", None)
+    if not instance:
+        return None
+    return f"https://{instance}/{record_id}"
+
+
 def clean_record(record: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in record.items() if key != "attributes"}
+
+
+_sf_object_fields_cache: dict[str, set[str]] = {}
+_sf_object_describe_cache: dict[str, list[dict]] = {}
+
+NON_QUERYABLE_TYPES = {"address", "location", "base64", "encryptedstring", "anyType"}
+
+
+def get_salesforce_client() -> Salesforce:
+    sf = getattr(app.state, "sf", None)
+    if sf is None:
+        detail = getattr(app.state, "sf_error", None) or "Salesforce is not configured."
+        raise HTTPException(status_code=503, detail=detail)
+    return sf
+
+
+async def get_object_describe(object_name: str) -> list[dict]:
+    """Return raw field metadata list for an object (cached)."""
+    cached = _sf_object_describe_cache.get(object_name)
+    if cached is not None:
+        return cached
+    sf = get_salesforce_client()
+    try:
+        meta = await run_in_threadpool(getattr(sf, object_name).describe)
+        fields = meta.get("fields", [])
+        _sf_object_describe_cache[object_name] = fields
+        return fields
+    except Exception as exc:
+        log.warning("[SF] Describe failed for %s: %s", object_name, exc)
+        _sf_object_describe_cache[object_name] = []
+        return []
+
+
+async def get_object_field_names(object_name: str) -> set[str]:
+    cached = _sf_object_fields_cache.get(object_name)
+    if cached is not None:
+        return cached
+    fields_meta = await get_object_describe(object_name)
+    fields = {str(f.get("name") or "") for f in fields_meta if f.get("name")}
+    _sf_object_fields_cache[object_name] = fields
+    log.info("[SF] Describe %s -> %d fields cached", object_name, len(fields))
+    return fields
+
+
+async def get_queryable_fields(object_name: str) -> list[str]:
+    """Return only fields that can be used in a SELECT query."""
+    fields_meta = await get_object_describe(object_name)
+    return [
+        str(f["name"])
+        for f in fields_meta
+        if f.get("name")
+        and f.get("queryable", True)
+        and f.get("type", "") not in NON_QUERYABLE_TYPES
+        and not str(f.get("name", "")).endswith("__pc")  # person account compound fields
+    ]
+
+
+async def get_supported_fields(object_name: str, candidate_fields: list[str]) -> list[str]:
+    available = await get_object_field_names(object_name)
+    return [field for field in candidate_fields if field in available]
 
 
 def json_extract(raw: str | None) -> dict[str, Any]:
@@ -228,6 +293,14 @@ def build_tqr_system_prompt(config: dict[str, Any]) -> str:
 
 
 def create_salesforce_client() -> Salesforce:
+    required = {
+        "SF_USERNAME": os.getenv("SF_USERNAME"),
+        "SF_PASSWORD": os.getenv("SF_PASSWORD"),
+        "SF_SECURITY_TOKEN": os.getenv("SF_SECURITY_TOKEN"),
+    }
+    missing = [key for key, value in required.items() if not (value or "").strip()]
+    if missing:
+        raise RuntimeError(f"Missing Salesforce environment variables: {', '.join(missing)}")
     return Salesforce(
         username=os.getenv("SF_USERNAME"),
         password=os.getenv("SF_PASSWORD"),
@@ -270,14 +343,23 @@ async def init_db() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    app.state.sf = await run_in_threadpool(create_salesforce_client)
+    app.state.sf = None
+    app.state.sf_error = None
+    try:
+        app.state.sf = await run_in_threadpool(create_salesforce_client)
+    except Exception as exc:
+        app.state.sf_error = str(exc)
+        log.warning("[Startup] Salesforce client unavailable: %s", exc)
     app.state.groq = Groq(api_key=os.getenv("GROQ_API_KEY"))
     app.state.prompt_config = load_prompt_config()
     app.state.tqr_system_prompt = build_tqr_system_prompt(app.state.prompt_config)
     app.state.rubric_scoring_model = app.state.prompt_config.get("models", {}).get("rubric_scoring_model", "openai/gpt-oss-120b")
     app.state.image_vision_model = "meta-llama/llama-4-scout-17b-16e-instruct"
     app.state.image_vision_models = ["meta-llama/llama-4-scout-17b-16e-instruct"]
-    log.info("App started — Salesforce + Groq clients ready")
+    if app.state.sf is not None:
+        log.info("App started - Salesforce + Groq clients ready")
+    else:
+        log.warning("App started without Salesforce connectivity")
     yield
 
 
@@ -292,7 +374,7 @@ app.add_middleware(
 
 
 async def sf_query_all(soql: str) -> list[dict[str, Any]]:
-    sf = app.state.sf
+    sf = get_salesforce_client()
     result = await run_in_threadpool(sf.query, soql)
     records = list(result.get("records", []))
     while not result.get("done", True):
@@ -412,6 +494,13 @@ def enrich_appointment(record: dict[str, Any], tqr: dict[str, Any] | None = None
     item["tqrScore"] = tqr.get("overall") if tqr else None
     item["RecordTypeName"] = (item.get("RecordType") or {}).get("Name")
     item["workOrderId"] = resolve_work_order_id(item)
+    # Calculate actual time on site from raw timestamps
+    actual_start = parse_salesforce_datetime(item.get("ActualStartTime"))
+    actual_end = parse_salesforce_datetime(item.get("ActualEndTime"))
+    if actual_start and actual_end and actual_end > actual_start:
+        item["ActualDurationMinutes"] = int((actual_end - actual_start).total_seconds() / 60)
+    else:
+        item["ActualDurationMinutes"] = None
     return item
 
 
@@ -494,7 +583,8 @@ async def fetch_work_order(work_order_id: str) -> dict[str, Any]:
     work_orders = await sf_query_all(
         f"""
         SELECT Id, WorkOrderNumber, Description, Street, City, PostalCode,
-               AccountId, ServiceTerritoryId, WorkTypeId, WorkType.Name, LastModifiedDate
+               AccountId, ServiceTerritoryId, WorkTypeId, WorkType.Name, LastModifiedDate,
+               Attendance_Notes_for_Office__c
         FROM WorkOrder
         WHERE Id = '{work_order_id}'
         LIMIT 1
@@ -564,14 +654,13 @@ def classify_document(title: str, file_type: str, source_label: str) -> str:
         return "payment"
     if "service report" in blob or "service_report" in blob or "customer service report" in blob:
         return "service-report"
-    # SA-XXXXXX pattern documents are service reports that typically contain customer signatures
     if re.search(r'\bsa[-_]\d+', title.lower()):
         return "service-report"
     return "document"
 
 
 async def fetch_images_for_entity(entity_id: str) -> list[dict[str, Any]]:
-    sf = app.state.sf
+    sf = get_salesforce_client()
     versions = await fetch_content_versions_for_entity(entity_id)
     images: list[dict[str, Any]] = []
     for version in versions:
@@ -631,14 +720,401 @@ async def fetch_documents_for_entity(entity_id: str, source_label: str) -> list[
     return documents
 
 
+async def attach_invoice_content_documents(invoice_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for inv in invoice_records:
+        inv_id = inv.get("Id")
+        if not inv_id:
+            continue
+        try:
+            cv_rows = await sf_query_all(
+                f"""
+                SELECT ContentDocumentId, ContentDocument.Title, ContentDocument.FileType,
+                       ContentDocument.LatestPublishedVersionId
+                FROM ContentDocumentLink
+                WHERE LinkedEntityId = '{inv_id}'
+                LIMIT 10
+                """
+            )
+            inv["contentDocuments"] = [
+                {
+                    "id": r.get("ContentDocumentId"),
+                    "title": (r.get("ContentDocument") or {}).get("Title") or "Invoice Document",
+                    "fileType": (r.get("ContentDocument") or {}).get("FileType"),
+                    "versionId": (r.get("ContentDocument") or {}).get("LatestPublishedVersionId"),
+                }
+                for r in cv_rows
+            ]
+            if inv["contentDocuments"]:
+                log.info("[SF] Invoice %s has %d document(s): %s", inv_id, len(inv["contentDocuments"]), [d["title"] for d in inv["contentDocuments"]])
+        except Exception as exc:
+            log.debug("[SF] Could not fetch ContentDocuments for invoice %s: %s", inv_id, str(exc)[:120])
+    return invoice_records
+
+
+async def fetch_invoices_for_job(job_id: str | None) -> list[dict[str, Any]]:
+    """Fetch Customer Invoice records and their attached ContentDocuments from the Job's related list."""
+    if not job_id:
+        return []
+
+    invoice_fields = [
+        "Id",
+        "Name",
+        "Balance_Outstanding_with_Interest__c",
+        "Charge_Gross__c",
+        "CreatedDate",
+        "Invoice_Document_URL__c",
+        "Account_Type__c",
+    ]
+
+    try:
+        supported_subquery_fields = await get_supported_fields("Customer_Invoice__c", invoice_fields)
+        if not supported_subquery_fields:
+            raise ValueError("No supported Customer_Invoice__c fields available for subquery")
+        rows = await sf_query_all(
+            f"""
+            SELECT Id, (
+                SELECT {", ".join(supported_subquery_fields)}
+                FROM Customer_Invoices_Credits__r
+                ORDER BY CreatedDate ASC
+                LIMIT 20
+            )
+            FROM Job__c WHERE Id = '{job_id}' LIMIT 1
+            """
+        )
+        if rows:
+            sub = rows[0].get("Customer_Invoices_Credits__r") or {}
+            invoice_records = sub.get("records") or []
+            invoice_records = [clean_record(r) for r in invoice_records]
+            for inv in invoice_records:
+                inv["_objectName"] = "Customer_Invoice__c"
+            log.info("[SF] Fetched %d invoice record(s) via relationship for job %s", len(invoice_records), job_id)
+            return await attach_invoice_content_documents(invoice_records)
+    except Exception as exc:
+        log.debug("[SF] Relationship subquery failed for job invoices (%s): %s", job_id, str(exc)[:200])
+
+    for obj_name in ("Customer_Invoice__c",):
+        try:
+            supported_fields = await get_supported_fields(obj_name, invoice_fields)
+            if not supported_fields:
+                log.info("[SF] Skipping %s invoice fetch because no supported fields were found", obj_name)
+                continue
+            rows = await sf_query_all(
+                f"SELECT {', '.join(supported_fields)} FROM {obj_name} WHERE Job__c = '{job_id}' ORDER BY CreatedDate ASC LIMIT 20"
+            )
+            if rows is not None:
+                log.info("[SF] Fetched %d invoice(s) from %s for job %s", len(rows), obj_name, job_id)
+                cleaned = [clean_record(r) for r in rows]
+                for inv in cleaned:
+                    inv["_objectName"] = obj_name
+                return await attach_invoice_content_documents(cleaned)
+        except Exception as exc:
+            log.debug("[SF] %s query failed: %s", obj_name, str(exc)[:80])
+
+    log.info("[SF] No invoice records found for job %s", job_id)
+    return []
+
+
+async def fetch_invoices_for_context(appointment: dict[str, Any], work_order_id: str | None) -> list[dict[str, Any]]:
+    job_id = appointment.get("Job__c")
+    job_number = appointment.get("Job_Number__c")
+    log.info("[Docs] Invoice context lookup start: appointment=%s job=%s jobNumber=%s workOrder=%s", appointment.get("Id"), job_id, appointment.get("Job_Number__c"), work_order_id)
+    invoices = await fetch_invoices_for_job(job_id)
+    if invoices:
+        log.info("[Docs] Invoice context resolved via job relationship/direct job query: %d invoice(s)", len(invoices))
+        return invoices
+
+    lookup_values = [
+        ("Job__c", job_id),
+        ("Job_Number__c", job_number),
+    ]
+    object_names = ["Customer_Invoice__c"]
+    invoice_fields = [
+        "Id",
+        "Name",
+        "Balance_Outstanding_with_Interest__c",
+        "Charge_Gross__c",
+        "CreatedDate",
+        "Invoice_Document_URL__c",
+        "Account_Type__c",
+    ]
+
+    for object_name in object_names:
+        supported_fields = await get_supported_fields(object_name, invoice_fields)
+        if not supported_fields:
+            log.info("[SF] Skipping %s context lookup because no supported fields were found", object_name)
+            continue
+        for field_name, field_value in lookup_values:
+            if not field_value:
+                continue
+            try:
+                rows = await sf_query_all(
+                    f"""
+                    SELECT {", ".join(supported_fields)}
+                    FROM {object_name}
+                    WHERE {field_name} = '{field_value}'
+                    ORDER BY CreatedDate ASC
+                    LIMIT 20
+                    """
+                )
+                if rows:
+                    cleaned = [clean_record(r) for r in rows]
+                    for inv in cleaned:
+                        inv["_objectName"] = object_name
+                    log.info("[SF] Fetched %d invoice(s) from %s via %s = %s", len(cleaned), object_name, field_name, field_value)
+                    return await attach_invoice_content_documents(cleaned)
+                log.info("[SF] No invoice rows from %s via %s = %s", object_name, field_name, field_value)
+            except Exception as exc:
+                log.debug("[SF] %s lookup via %s failed: %s", object_name, field_name, str(exc)[:120])
+    log.info("[Docs] Invoice context lookup exhausted with no invoices: appointment=%s job=%s workOrder=%s", appointment.get("Id"), job_id, work_order_id)
+    return []
+
+
+def invoice_content_docs_to_documents(invoice_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert ContentDocuments attached to invoice records into the standard document format."""
+    docs: list[dict[str, Any]] = []
+    for inv in invoice_records:
+        inv_name = inv.get("Name") or "Invoice"
+        for cd in (inv.get("contentDocuments") or []):
+            version_id = cd.get("versionId")
+            if not version_id:
+                continue
+            file_type = (cd.get("fileType") or "").lower()
+            docs.append({
+                "id": version_id,
+                "title": cd.get("title") or f"{inv_name} Document",
+                "fileType": file_type,
+                "contentType": DOCUMENT_CONTENT_TYPES.get(file_type, "application/octet-stream"),
+                "source": "invoice",
+                "category": "invoice",
+            })
+    return docs
+
+
+async def fetch_url_documents_for_invoice_records(invoice_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    docs: list[dict[str, Any]] = []
+    candidate_fields = [
+        ("Invoice_Document_URL__c", "invoice"),
+    ]
+    object_candidates = ["Customer_Invoice__c"]
+
+    for inv in invoice_records:
+        inv_id = inv.get("Id")
+        inv_name = inv.get("Name") or "Customer Invoice"
+        if not inv_id:
+            continue
+        log.info("[Docs] Checking invoice record URLs: invoiceId=%s invoiceName=%s object=%s", inv_id, inv_name, inv.get("_objectName"))
+
+        record_url = salesforce_record_url(inv_id)
+        if record_url:
+            docs.append(
+                {
+                    "id": f"{inv_id}:record",
+                    "title": f"Invoice - {inv_name}",
+                    "fileType": "URL",
+                    "contentType": "text/uri-list",
+                    "source": "invoice-record",
+                    "category": "invoice",
+                    "externalUrl": record_url,
+                }
+            )
+
+        direct_field_values = {"Invoice_Document_URL__c": inv.get("Invoice_Document_URL__c")}
+        found_url = False
+        for field_name, category in candidate_fields:
+            value = direct_field_values.get(field_name)
+            if isinstance(value, str) and value.strip().startswith("http"):
+                log.info("[Docs] Found direct invoice URL on invoice record: invoiceId=%s field=%s url=%s", inv_id, field_name, value.strip())
+                docs.append(
+                    {
+                        "id": f"{inv_id}:{field_name}",
+                        "title": f"{'Invoice' if category == 'invoice' else 'Payment'} - {inv_name}",
+                        "fileType": "PDF",
+                        "contentType": "application/pdf",
+                        "source": "invoice-record",
+                        "category": category,
+                        "externalUrl": value.strip(),
+                    }
+                )
+                found_url = True
+                break
+
+        object_names = _unique_strings([str(inv.get("_objectName") or "").strip(), *object_candidates])
+        for object_name in object_names:
+            if found_url:
+                break
+            supported_fields = await get_supported_fields(object_name, [field_name for field_name, _ in candidate_fields])
+            supported_candidates = [(field_name, category) for field_name, category in candidate_fields if field_name in supported_fields]
+            if not supported_candidates:
+                log.info("[Docs] No supported invoice URL fields on %s for invoiceId=%s", object_name, inv_id)
+                continue
+            for field_name, category in supported_candidates:
+                rows = await sf_query_all_safe(
+                    f"""
+                    SELECT Id, {field_name}
+                    FROM {object_name}
+                    WHERE Id = '{inv_id}'
+                    LIMIT 1
+                    """
+                )
+                if not rows:
+                    log.info("[Docs] No row returned for invoice URL lookup: invoiceId=%s object=%s field=%s", inv_id, object_name, field_name)
+                    continue
+                value = rows[0].get(field_name)
+                if isinstance(value, str) and value.strip().startswith("http"):
+                    log.info("[Docs] Found invoice URL by follow-up query: invoiceId=%s object=%s field=%s url=%s", inv_id, object_name, field_name, value.strip())
+                    docs.append(
+                        {
+                            "id": f"{inv_id}:{field_name}",
+                            "title": f"{'Invoice' if category == 'invoice' else 'Payment'} - {inv_name}",
+                            "fileType": "PDF",
+                            "contentType": "application/pdf",
+                            "source": "invoice-record",
+                            "category": category,
+                            "externalUrl": value.strip(),
+                        }
+                    )
+                    found_url = True
+                    break
+                log.info("[Docs] Invoice URL field empty on follow-up query: invoiceId=%s object=%s field=%s", inv_id, object_name, field_name)
+    return docs
+
+
+async def fetch_customer_invoice_documents_for_job(job_id: str | None, job_number: str | None = None) -> list[dict[str, Any]]:
+    if not job_id and not job_number:
+        return []
+
+    docs: list[dict[str, Any]] = []
+    object_names = ["Customer_Invoice__c"]
+    query_field_candidates = ["Id", "Name", "Invoice_Document_URL__c"]
+    log.info("[Docs] Direct job invoice URL lookup start: job=%s jobNumber=%s", job_id, job_number)
+
+    for object_name in object_names:
+        supported_fields = await get_supported_fields(object_name, query_field_candidates)
+        if not supported_fields:
+            log.info("[Docs] Skipping %s direct invoice URL lookup because no supported fields were found", object_name)
+            continue
+        lookups = []
+        if job_id:
+            lookups.append(("Job__c", job_id))
+        if job_number:
+            lookups.extend([
+                ("Job_Number__c", job_number),
+            ])
+        for field_name, field_value in lookups:
+            rows = await sf_query_all_safe(
+                f"""
+                SELECT {", ".join(supported_fields)}
+                FROM {object_name}
+                WHERE {field_name} = '{field_value}'
+                ORDER BY CreatedDate ASC
+                LIMIT 20
+                """
+            )
+            if not rows:
+                log.info("[Docs] No direct invoice URL rows from %s via %s = %s", object_name, field_name, field_value)
+                continue
+            log.info("[Docs] Direct invoice URL rows from %s via %s = %s: %d", object_name, field_name, field_value, len(rows))
+            for row in rows:
+                row = clean_record(row)
+                inv_id = row.get("Id")
+                inv_name = row.get("Name") or "Customer Invoice"
+                value = row.get("Invoice_Document_URL__c")
+                if isinstance(value, str) and value.strip().startswith("http"):
+                    log.info("[Docs] Found direct job invoice URL: object=%s lookup=%s invoiceId=%s invoiceName=%s url=%s", object_name, field_name, inv_id, inv_name, value.strip())
+                    docs.append(
+                        {
+                            "id": f"{inv_id}:job-direct-invoice-url",
+                            "title": f"Invoice - {inv_name}",
+                            "fileType": "PDF",
+                            "contentType": "application/pdf",
+                            "source": "job-invoice",
+                            "category": "invoice",
+                            "externalUrl": value.strip(),
+                        }
+                    )
+                else:
+                    log.info("[Docs] Invoice row has no direct invoice URL: object=%s lookup=%s invoiceId=%s invoiceName=%s", object_name, field_name, inv_id, inv_name)
+            if docs:
+                log.info("[Docs] Found %d direct invoice URL document(s) from %s", len(docs), object_name)
+                break
+        if docs:
+            break
+    if not docs:
+        log.info("[Docs] Direct job invoice URL lookup found no documents for job=%s jobNumber=%s", job_id, job_number)
+    return docs
+
+
+async def fetch_invoice_documents_for_job_simple(job_id, job_number=None):
+    if not job_id and not job_number:
+        return []
+    docs = []
+    try:
+        log.info("[Docs] Simple invoice fetch start: job=%s jobNumber=%s", job_id, job_number)
+        supported_fields = await get_supported_fields("Customer_Invoice__c", ["Id", "Name", "Invoice_Document_URL__c"])
+        if not supported_fields:
+            log.info("[Docs] Simple invoice fetch aborted because Customer_Invoice__c fields are unavailable")
+            return []
+        lookups = []
+        if job_id:
+            lookups.append(("Job__c", job_id))
+        if job_number:
+            lookups.append(("Job_Number__c", job_number))
+        for field_name, field_value in lookups:
+            log.info("[Docs] Simple invoice fetch querying Customer_Invoice__c via %s = %s", field_name, field_value)
+            rows = await sf_query_all(
+                f"""
+                SELECT {", ".join(supported_fields)}
+                FROM Customer_Invoice__c
+                WHERE {field_name} = '{field_value}'
+                ORDER BY CreatedDate ASC
+                LIMIT 20
+                """
+            )
+            log.info("[Docs] Simple invoice fetch rows via %s = %s -> %d", field_name, field_value, len(rows or []))
+            for row in rows:
+                row = clean_record(row)
+                inv_id = row.get("Id", "")
+                inv_name = row.get("Name") or "Invoice"
+                url = row.get("Invoice_Document_URL__c")
+                if isinstance(url, str) and url.strip().startswith("http"):
+                    log.info("[Docs] Simple invoice fetch found PDF URL: invoiceId=%s invoiceName=%s url=%s", inv_id, inv_name, url.strip())
+                    docs.append({
+                        "id": f"{inv_id}:invoice-url",
+                        "title": f"Invoice - {inv_name}",
+                        "fileType": "PDF",
+                        "contentType": "application/pdf",
+                        "source": "job-invoice",
+                        "category": "invoice",
+                        "externalUrl": url.strip(),
+                    })
+                else:
+                    log.info("[Docs] Simple invoice fetch row missing PDF URL: invoiceId=%s invoiceName=%s", inv_id, inv_name)
+            if docs:
+                log.info("[Docs] Simple invoice fetch succeeded via %s = %s with %d doc(s)", field_name, field_value, len(docs))
+                break
+    except Exception as exc:
+        log.warning("[Docs] Invoice fetch failed for job %s / jobNumber %s: %s", job_id, job_number, exc)
+    if not docs:
+        log.info("[Docs] Simple invoice fetch found no invoice PDFs for job=%s jobNumber=%s", job_id, job_number)
+    return docs
+
+
 async def fetch_related_documents(appointment: dict[str, Any], work_order_id: str | None) -> list[dict[str, Any]]:
     docs: list[dict[str, Any]] = []
+    log.info("[Docs] fetch_related_documents start: appointment=%s job=%s jobNumber=%s workOrder=%s", appointment.get("Id"), appointment.get("Job__c"), appointment.get("Job_Number__c"), work_order_id)
     docs.extend(await fetch_documents_for_entity(appointment["Id"], "appointment"))
     if work_order_id:
         docs.extend(await fetch_documents_for_entity(work_order_id, "work-order"))
     job_id = appointment.get("Job__c")
     if job_id:
         docs.extend(await fetch_documents_for_entity(job_id, "job"))
+        docs.extend(await fetch_customer_invoice_documents_for_job(job_id, appointment.get("Job_Number__c")))
+    else:
+        docs.extend(await fetch_customer_invoice_documents_for_job(None, appointment.get("Job_Number__c")))
+    invoice_records = await fetch_invoices_for_context(appointment, work_order_id)
+    if invoice_records:
+        docs.extend(invoice_content_docs_to_documents(invoice_records))
+        docs.extend(await fetch_url_documents_for_invoice_records(invoice_records))
 
     seen: set[str] = set()
     unique_docs: list[dict[str, Any]] = []
@@ -647,6 +1123,7 @@ async def fetch_related_documents(appointment: dict[str, Any], work_order_id: st
             continue
         seen.add(doc["id"])
         unique_docs.append(doc)
+    log.info("[Docs] fetch_related_documents result: %d document(s) -> %s", len(unique_docs), [f"{d.get('category')}:{d.get('title')}" for d in unique_docs])
     return unique_docs
 
 
@@ -659,7 +1136,12 @@ async def fetch_url_documents_for_record(
     if not record_id:
         return []
     documents: list[dict[str, Any]] = []
-    for field_name, category in candidates:
+    supported_fields = await get_supported_fields(object_name, [field_name for field_name, _ in candidates])
+    supported_candidates = [(field_name, category) for field_name, category in candidates if field_name in supported_fields]
+    if not supported_candidates:
+        log.info("[Docs] No supported direct URL fields on %s for record %s", object_name, record_id)
+        return []
+    for field_name, category in supported_candidates:
         rows = await sf_query_all_safe(
             f"""
             SELECT Id, {field_name}
@@ -698,7 +1180,10 @@ async def fetch_direct_url_documents(appointment: dict[str, Any], work_order_id:
                 ("Customer_Service_Report_URL__c", "service-report"),
                 ("Service_Report_PDF_URL__c", "service-report"),
                 ("Invoice_Document_URL__c", "invoice"),
+                ("Invoice_URL__c", "invoice"),
+                ("CCT_Invoice_URL__c", "invoice"),
                 ("Payment_Document_URL__c", "payment"),
+                ("Payment_URL__c", "payment"),
             ],
         )
     )
@@ -709,6 +1194,8 @@ async def fetch_direct_url_documents(appointment: dict[str, Any], work_order_id:
             "work-order",
             [
                 ("Invoice_Document_URL__c", "invoice"),
+                ("Invoice_URL__c", "invoice"),
+                ("CCT_Invoice_URL__c", "invoice"),
                 ("Payment_Document_URL__c", "payment"),
                 ("Service_Report_URL__c", "service-report"),
             ],
@@ -721,16 +1208,21 @@ async def fetch_direct_url_documents(appointment: dict[str, Any], work_order_id:
             "job",
             [
                 ("Invoice_Document_URL__c", "invoice"),
+                ("Invoice_URL__c", "invoice"),
+                ("CCT_Invoice_URL__c", "invoice"),
+                ("CCT_Invoice_Document_URL__c", "invoice"),
                 ("Payment_Document_URL__c", "payment"),
                 ("Service_Report_URL__c", "service-report"),
             ],
         )
     )
+    if docs:
+        log.info("[Docs] Found %d URL document(s): %s", len(docs), [d.get("title") for d in docs])
     return docs
 
 
 async def fetch_version_bytes(version_id: str) -> tuple[bytes, str]:
-    sf = app.state.sf
+    sf = get_salesforce_client()
     url = f"{sf.base_url}sobjects/ContentVersion/{version_id}/VersionData"
     response = await run_in_threadpool(
         sf.session.get,
@@ -1041,10 +1533,6 @@ the engineer report rather than pretending certainty where the evidence is thin.
 """
 
 
-# ---------------------------------------------------------------------------
-# FIX 1: _compute_weighted_verdict — now logs every decision step
-# FIX 2: Image Quality score <=4 is now a hard fail (was only 0 photos before)
-# ---------------------------------------------------------------------------
 def _compute_weighted_verdict(
     fields: dict[str, Any],
     appointment_number: str = "UNKNOWN",
@@ -1053,7 +1541,6 @@ def _compute_weighted_verdict(
     prefix = f"[TQR:{appointment_number}]"
     hard_fail_reasons: list[str] = []
 
-    # --- Hard fail checks ---
     img = fields.get("imagesQuality") or {}
     img_score = safe_float(img.get("score", 0))
 
@@ -1102,8 +1589,6 @@ def _compute_weighted_verdict(
 
     hard_fail = bool(hard_fail_reasons)
 
-    # --- Score calculation ---
-    # Respect AI outcome=Pass; only map to 0 when clearly No
     sig_score = 10 if sig_pass else 0
     pay_obj = fields.get("paymentAttempted") or {}
     pay_value = pay_obj.get("value", "No")
@@ -1140,25 +1625,13 @@ def _compute_weighted_verdict(
         )
 
     weighted += pay_score * 0.10 + sig_score * 0.05
-    log.info(
-        "%s   %-18s score=%4.1f  weight=%3.0f%%  contribution=%4.2f",
-        prefix, "paymentAttempted", float(pay_score), 10, pay_score * 0.10,
-    )
-    log.info(
-        "%s   %-18s score=%4.1f  weight=%3.0f%%  contribution=%4.2f",
-        prefix, "customerSignature", float(sig_score), 5, sig_score * 0.05,
-    )
     log.info("%s ── Total weighted score = %.2f / 10 (%.0f%%)", prefix, weighted, weighted * 10)
 
     percentage = weighted * 10
 
-    # --- Verdict logic ---
     if hard_fail:
         verdict = "Unacceptable"
-        log.warning(
-            "%s Verdict = %s (hard fail triggered — reasons: %s)",
-            prefix, verdict, "; ".join(hard_fail_reasons),
-        )
+        log.warning("%s Verdict = %s (hard fail triggered — reasons: %s)", prefix, verdict, "; ".join(hard_fail_reasons))
     elif percentage >= 80:
         verdict = "TQR"
         log.info("%s Verdict = %s (score %.0f%% >= 80%%)", prefix, verdict, percentage)
@@ -1172,9 +1645,6 @@ def _compute_weighted_verdict(
     return round(weighted, 2), verdict, hard_fail, hard_fail_reasons
 
 
-# ---------------------------------------------------------------------------
-# FIX 3: Build a summary that ALWAYS matches the computed verdict
-# ---------------------------------------------------------------------------
 def _build_verdict_summary(
     verdict: str,
     hard_fail: bool,
@@ -1182,12 +1652,7 @@ def _build_verdict_summary(
     overall_score: float,
     ai_observations: str,
 ) -> str:
-    """
-    Replaces the raw Groq overallObservations with a summary that leads
-    with the real verdict so the two never contradict each other.
-    """
     score_pct = round(overall_score * 10)
-
     if hard_fail:
         reasons_text = "; ".join(hard_fail_reasons)
         prefix = f"⛔ HARD FAIL — {reasons_text}."
@@ -1195,9 +1660,8 @@ def _build_verdict_summary(
         prefix = f"❌ UNACCEPTABLE — Score {score_pct}% is below the minimum 50% threshold."
     elif verdict == "Sub standard":
         prefix = f"⚠️ SUB STANDARD — Score {score_pct}% is below the 80% TQR threshold."
-    else:  # TQR
+    else:
         prefix = f"✅ TQR PASS — Score {score_pct}% meets the required standard."
-
     return f"{prefix} AI observations: {ai_observations}"
 
 
@@ -1293,6 +1757,7 @@ async def run_tqr_analysis(
     account: dict[str, Any] | None,
     images: list[dict[str, Any]],
     documents: list[dict[str, Any]] | None = None,
+    invoices: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     client = app.state.groq
     tqr_system_prompt = app.state.tqr_system_prompt
@@ -1348,8 +1813,20 @@ async def run_tqr_analysis(
         "invoice": {
             "chargeTotal": safe_float(appointment.get("CCT_Charge_Gross__c")),
             "paymentStatus": appointment.get("Payment_Attempted__c", "unknown"),
-            "hasInvoiceDocument": bool(invoice_docs),
+            "hasInvoiceDocument": bool(invoice_docs or (invoices or [])),
             "hasPaymentDocument": bool(payment_docs),
+            "hasServiceReportDocument": bool(service_report_docs),
+            "supportingDocuments": [doc.get("title") for doc in (invoice_docs + payment_docs + service_report_docs)],
+            "invoiceRecords": [
+                {
+                    "invoiceNumber": inv.get("Name"),
+                    "recordType": (inv.get("RecordType") or {}).get("Name") or inv.get("RecordType__c"),
+                    "chargeGross": inv.get("Charge_Gross__c") or inv.get("Total_Amount__c"),
+                    "balanceOutstanding": inv.get("Balance_Outstanding_with_Interest__c") or inv.get("Balance_Outstanding__c"),
+                    "createdDate": inv.get("CreatedDate"),
+                }
+                for inv in (invoices or [])
+            ],
         },
         "signature": {
             "present": bool(appointment.get("Customer_Signature__c")) or bool(service_report_docs),
@@ -1365,11 +1842,12 @@ async def run_tqr_analysis(
     }
 
     log.info(
-        "%s Evidence sent to Groq — charge=£%.2f, paymentStatus=%s, signaturePresent=%s",
+        "%s Evidence sent to Groq — charge=£%.2f, paymentStatus=%s, signaturePresent=%s, invoiceRecords=%d",
         prefix,
         safe_float(appointment.get("CCT_Charge_Gross__c")),
         appointment.get("Payment_Attempted__c", "unknown"),
         bool(appointment.get("Customer_Signature__c")),
+        len(invoices or []),
     )
 
     log.info("%s Generating %d image description(s) for rubric scoring", prefix, len(images))
@@ -1403,12 +1881,65 @@ async def run_tqr_analysis(
     payment_status = appointment.get("Payment_Attempted__c")
     charge_total = safe_float(appointment.get("CCT_Charge_Gross__c"))
     account_type = str(appointment.get("Account_Type__c") or "").strip().lower()
-    if (
+    invoice_list = invoices or []
+    has_invoice_records = bool(invoice_list)
+    if not account_type and invoice_list:
+        account_type = str(invoice_list[0].get("Account_Type__c") or "").strip().lower()
+
+    if has_invoice_records:
+        total_outstanding = sum(
+            safe_float(inv.get("Balance_Outstanding_with_Interest__c") or inv.get("Balance_Outstanding__c"))
+            for inv in invoice_list
+        )
+        invoice_numbers = [inv.get("Name") for inv in invoice_list if inv.get("Name")]
+        log.info(
+            "%s Invoice records fetched: %d — outstanding balance: £%.2f — invoices: %s",
+            prefix, len(invoice_list), total_outstanding, invoice_numbers,
+        )
+        if not str(payment_status or "").strip() and account_type != "key account":
+            if total_outstanding == 0:
+                payment_field["value"] = "Yes"
+                payment_field["salesforceValue"] = "Yes"
+                payment_field["outcome"] = "Pass"
+                payment_field["confidence"] = 0.8
+                payment_field["rationale"] = f"Invoice records found ({', '.join(invoice_numbers)}). All balances are zero — payment has been collected."
+                payment_field["evidenceCited"] = [f"Invoice {n}" for n in invoice_numbers] + [f"Total outstanding: £{total_outstanding:.2f}"]
+            else:
+                payment_field["value"] = "No"
+                payment_field["salesforceValue"] = "No"
+                payment_field["outcome"] = "Fail"
+                payment_field["confidence"] = 0.8
+                payment_field["rationale"] = f"Invoice records found ({', '.join(invoice_numbers)}) but outstanding balance of £{total_outstanding:.2f} remains — payment not fully collected."
+                payment_field["evidenceCited"] = [f"Invoice {n}" for n in invoice_numbers] + [f"Total outstanding: £{total_outstanding:.2f}"]
+            fields["paymentAttempted"] = payment_field
+    elif (
+        charge_total > 0
+        and not str(payment_status or "").strip()
+        and (invoice_docs or payment_docs or service_report_docs)
+    ):
+        payment_field["value"] = "No"
+        payment_field["outcome"] = "Review"
+        payment_field["confidence"] = min(safe_float(payment_field.get("confidence", 0.5)) or 0.5, 0.5)
+        payment_field["reviewReason"] = "Supporting payment-related documents are visible, but the payment status is blank, so manual review is needed."
+        payment_field["rationale"] = "Charge total is present and related documents exist, but the payment field is blank so the final payment outcome cannot be confirmed automatically."
+        evidence_cited = list(payment_field.get("evidenceCited") or [])
+        evidence_cited.append(f"chargeTotal is {charge_total}")
+        if invoice_docs:
+            evidence_cited.append(f"Invoice documents visible: {', '.join(str(doc.get('title') or 'Invoice Document') for doc in invoice_docs[:3])}")
+        if payment_docs:
+            evidence_cited.append(f"Payment documents visible: {', '.join(str(doc.get('title') or 'Payment Document') for doc in payment_docs[:3])}")
+        if service_report_docs:
+            evidence_cited.append(f"Service report documents visible: {', '.join(str(doc.get('title') or 'Service Report') for doc in service_report_docs[:3])}")
+        payment_field["evidenceCited"] = evidence_cited
+        fields["paymentAttempted"] = payment_field
+    elif (
         charge_total > 0
         and not str(payment_status or "").strip()
         and account_type != "key account"
         and not invoice_docs
         and not payment_docs
+        and not service_report_docs
+        and not has_invoice_records
     ):
         payment_field["value"] = "No"
         payment_field["outcome"] = "Review"
@@ -1422,7 +1953,6 @@ async def run_tqr_analysis(
         payment_field["evidenceCited"] = evidence_cited
         fields["paymentAttempted"] = payment_field
 
-    # Log every AI field decision
     log.info("%s ── Groq raw field decisions ────────────────", prefix)
     for field_name, field_data in fields.items():
         score = field_data.get("score", field_data.get("value", "N/A"))
@@ -1433,12 +1963,10 @@ async def run_tqr_analysis(
     ai_observations = (payload.get("summary") or {}).get("overallObservations", "AI analysis completed.")
     log.info("%s Groq raw summary: %s", prefix, ai_observations[:200])
 
-    # Compute verdict AFTER AI runs so we can reconcile the summary
     overall_score, verdict, hard_fail, hard_fail_reasons = _compute_weighted_verdict(
         fields, appointment_number=appt_num, photo_count=len(images)
     )
 
-    # FIX 3: Build a summary that matches the verdict — never contradicts it
     final_summary = _build_verdict_summary(
         verdict, hard_fail, hard_fail_reasons, overall_score, ai_observations
     )
@@ -1469,7 +1997,7 @@ async def run_tqr_analysis(
         "safety": safe_float((fields.get("workmanship") or {}).get("urgentIssueDetected", False)) * 10,
         "completion": safe_float((fields.get("imagesQuality") or {}).get("score", 0)),
         "overall": overall_score,
-        "summary": final_summary,           # ← FIX 3: verdict-aligned summary
+        "summary": final_summary,
         "flags": flags,
         "recommendation": verdict,
         "tqr_fields": fields,
@@ -1477,6 +2005,28 @@ async def run_tqr_analysis(
         "hard_fail": hard_fail,
         "verdict": verdict,
     }
+
+
+# =============================================================================
+# API ENDPOINTS
+# =============================================================================
+
+@app.get("/api/appointments/lookup")
+async def lookup_appointment_by_number(q: str = Query(..., min_length=1)):
+    """Direct Salesforce lookup by AppointmentNumber — bypasses queue filters."""
+    safe_q = q.strip().replace("'", "")
+    records = await sf_query_all(
+        f"""
+        SELECT {", ".join(APPOINTMENT_FIELDS)}
+        FROM ServiceAppointment
+        WHERE AppointmentNumber LIKE '%{safe_q}%'
+        ORDER BY ActualEndTime DESC
+        LIMIT 10
+        """
+    )
+    cached = await get_all_cached_results()
+    enriched = [enrich_appointment(r, cached.get(r["Id"])) for r in records]
+    return {"records": enriched, "total": len(enriched)}
 
 
 @app.get("/api/appointments")
@@ -1515,7 +2065,22 @@ async def get_appointment(appointment_id: str):
     territory = await fetch_service_territory(work_order.get("ServiceTerritoryId") if work_order else None)
     documents = await fetch_related_documents(appointment, work_order_id)
     documents.extend(await fetch_direct_url_documents(appointment, work_order_id))
+    job_id = appointment.get("Job__c")
+    invoice_docs = await fetch_invoice_documents_for_job_simple(job_id, appointment.get("Job_Number__c"))
+    log.info("[Docs] get_appointment %s: base docs=%d simpleInvoiceDocs=%d", appointment_id, len(documents), len(invoice_docs))
+    existing_ids = {d["id"] for d in documents}
+    for doc in invoice_docs:
+        if doc["id"] not in existing_ids:
+            documents.append(doc)
+            existing_ids.add(doc["id"])
+            log.info("[Docs] get_appointment %s: appended invoice doc %s", appointment_id, doc.get("title"))
+        else:
+            log.info("[Docs] get_appointment %s: skipped duplicate doc %s", appointment_id, doc.get("title"))
+    log.info("[Docs] get_appointment %s final documents: %s", appointment_id, [f"{d.get('category')}:{d.get('title')}" for d in documents])
     detail = enrich_appointment(appointment, cached)
+    # If Attendance_Notes_for_Office__c is missing on the SA, fall back to the WorkOrder field
+    if not detail.get("Attendance_Notes_for_Office__c") and work_order:
+        detail["Attendance_Notes_for_Office__c"] = work_order.get("Attendance_Notes_for_Office__c")
     detail["workOrderId"] = work_order_id
     detail["workOrder"] = work_order
     detail["account"] = account
@@ -1523,6 +2088,40 @@ async def get_appointment(appointment_id: str):
     detail["accountManager"] = ((account or {}).get("Owner") or {}).get("Name")
     detail["documents"] = documents
     return detail
+
+
+# ── NEW: dedicated documents endpoint used by the frontend ─────────────────
+@app.get("/api/appointments/{appointment_id}/documents")
+async def get_appointment_documents(appointment_id: str):
+    """
+    Return all related documents (service reports, invoices, payments, etc.)
+    for a given appointment. The frontend calls this independently so the
+    main appointment load isn't blocked waiting for document fetches.
+    """
+    appointment = await fetch_appointment_by_id(appointment_id)
+    work_order_id = resolve_work_order_id(appointment)
+
+    documents = await fetch_related_documents(appointment, work_order_id)
+    documents.extend(await fetch_direct_url_documents(appointment, work_order_id))
+
+    job_id = appointment.get("Job__c")
+    invoice_docs = await fetch_invoice_documents_for_job_simple(
+        job_id, appointment.get("Job_Number__c")
+    )
+
+    existing_ids = {d["id"] for d in documents}
+    for doc in invoice_docs:
+        if doc["id"] not in existing_ids:
+            documents.append(doc)
+            existing_ids.add(doc["id"])
+
+    log.info(
+        "[Docs] /documents for %s → %d doc(s): %s",
+        appointment_id,
+        len(documents),
+        [f"{d.get('category')}:{d.get('title')}" for d in documents],
+    )
+    return {"documents": documents}
 
 
 @app.get("/api/work-orders/{work_order_id}")
@@ -1571,9 +2170,162 @@ async def open_content(version_id: str, inline: bool = Query(True)):
     )
 
 
+@app.get("/api/debug/url-fields/{appointment_id}")
+async def debug_url_fields(appointment_id: str):
+    """Find all URL fields on SA/WO/Job that might store invoice/document URLs."""
+    sf = get_salesforce_client()
+    appointment = await fetch_appointment_by_id(appointment_id)
+    job_id = appointment.get("Job__c")
+    work_order_id = resolve_work_order_id(appointment)
 
-_sf_label_to_api: dict[str, str] = {}        # label.lower() -> API name
-_sf_api_to_picklist: dict[str, list[str]] = {}  # API name -> valid picklist values
+    found: dict[str, list[dict]] = {}
+    for obj_name, record_id in [
+        ("ServiceAppointment", appointment.get("Id")),
+        ("WorkOrder", work_order_id),
+        ("Job__c", job_id),
+    ]:
+        if not record_id:
+            continue
+        try:
+            meta = await run_in_threadpool(getattr(sf, obj_name).describe)
+            url_fields = [
+                f["name"] for f in meta["fields"]
+                if f["type"] in ("url", "string", "textarea")
+                and any(kw in f["name"].lower() for kw in ("url", "document", "invoice", "report", "payment", "pdf", "link"))
+            ]
+            if url_fields:
+                rows = await sf_query_all_safe(
+                    f"SELECT Id, {', '.join(url_fields[:30])} FROM {obj_name} WHERE Id = '{record_id}' LIMIT 1"
+                )
+                if rows:
+                    non_empty = {k: v for k, v in rows[0].items() if v and k != "attributes" and k != "Id"}
+                    found[obj_name] = non_empty
+        except Exception as exc:
+            found[obj_name] = {"error": str(exc)}
+    return found
+
+
+@app.get("/api/debug/invoice-check/{appointment_id}")
+async def debug_invoice_check(appointment_id: str):
+    """
+    Shows exactly what job/invoice data exists for an appointment.
+    Open this in your browser: http://localhost:8000/api/debug/invoice-check/{appointment_id}
+    """
+    appointment = await fetch_appointment_by_id(appointment_id)
+    job_id = appointment.get("Job__c")
+    job_number = appointment.get("Job_Number__c")
+    work_order_id = resolve_work_order_id(appointment)
+
+    result: dict[str, Any] = {
+        "appointment_id": appointment_id,
+        "appointment_number": appointment.get("AppointmentNumber"),
+        "job_id": job_id,
+        "job_number": job_number,
+        "work_order_id": work_order_id,
+        "invoice_checks": {},
+        "documents_found": [],
+    }
+
+    if job_id:
+        for obj in ("Customer_Invoice__c", "Customer_Invoice_Credit__c"):
+            try:
+                rows = await sf_query_all_safe(
+                    f"""
+                    SELECT Id, Name, Invoice_Document_URL__c, CCT_Invoice_Document_URL__c,
+                           Invoice_URL__c, CCT_Invoice_URL__c, Balance_Outstanding_with_Interest__c
+                    FROM {obj}
+                    WHERE Job__c = '{job_id}'
+                    LIMIT 10
+                    """
+                )
+                result["invoice_checks"][f"{obj}_via_Job__c"] = [
+                    {
+                        "id": r.get("Id"),
+                        "name": r.get("Name"),
+                        "Invoice_Document_URL__c": r.get("Invoice_Document_URL__c"),
+                        "CCT_Invoice_Document_URL__c": r.get("CCT_Invoice_Document_URL__c"),
+                        "Invoice_URL__c": r.get("Invoice_URL__c"),
+                        "CCT_Invoice_URL__c": r.get("CCT_Invoice_URL__c"),
+                        "balance": r.get("Balance_Outstanding_with_Interest__c"),
+                    }
+                    for r in rows
+                ]
+            except Exception as exc:
+                result["invoice_checks"][f"{obj}_via_Job__c"] = {"error": str(exc)[:200]}
+
+    if job_number:
+        try:
+            rows = await sf_query_all_safe(
+                f"""
+                SELECT Id, Name, Invoice_Document_URL__c, CCT_Invoice_Document_URL__c
+                FROM Customer_Invoice__c
+                WHERE Job_Number__c = '{job_number}'
+                LIMIT 10
+                """
+            )
+            result["invoice_checks"]["Customer_Invoice__c_via_Job_Number__c"] = [
+                {
+                    "id": r.get("Id"),
+                    "name": r.get("Name"),
+                    "Invoice_Document_URL__c": r.get("Invoice_Document_URL__c"),
+                    "CCT_Invoice_Document_URL__c": r.get("CCT_Invoice_Document_URL__c"),
+                }
+                for r in rows
+            ]
+        except Exception as exc:
+            result["invoice_checks"]["Customer_Invoice__c_via_Job_Number__c"] = {"error": str(exc)[:200]}
+
+    try:
+        docs = await fetch_related_documents(appointment, work_order_id)
+        docs.extend(await fetch_direct_url_documents(appointment, work_order_id))
+        inv_docs = await fetch_invoice_documents_for_job_simple(job_id, job_number)
+        all_docs = docs + inv_docs
+        result["documents_found"] = [
+            {
+                "id": d.get("id"),
+                "title": d.get("title"),
+                "category": d.get("category"),
+                "source": d.get("source"),
+                "fileType": d.get("fileType"),
+                "hasExternalUrl": bool(d.get("externalUrl")),
+            }
+            for d in all_docs
+        ]
+    except Exception as exc:
+        result["documents_found"] = {"error": str(exc)[:300]}
+
+    return result
+
+
+# ── FIXED: proxy now forces inline so PDFs open in browser not download ────
+@app.get("/api/proxy-sf-url")
+async def proxy_sf_url(url: str = Query(...)):
+    """Proxy a Salesforce-hosted content URL through the authenticated session."""
+    sf = get_salesforce_client()
+    if not url.startswith("https://"):
+        raise HTTPException(status_code=400, detail="Only HTTPS URLs are supported")
+    try:
+        response = await run_in_threadpool(
+            sf.session.get,
+            url,
+            headers={"Authorization": f"Bearer {sf.session_id}"},
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "application/octet-stream")
+        # Force inline so PDFs open in the browser tab instead of downloading
+        return Response(
+            content=response.content,
+            media_type=content_type,
+            headers={"Content-Disposition": "inline"},
+        )
+    except Exception as exc:
+        log.error("[Proxy] Failed to fetch SF URL %s: %s", url, exc)
+        raise HTTPException(status_code=502, detail=f"Could not fetch document: {exc}")
+
+
+_sf_label_to_api: dict[str, str] = {}
+_sf_api_to_picklist: dict[str, list[str]] = {}
 
 
 async def _get_sa_field_map() -> dict[str, str]:
@@ -1582,19 +2334,17 @@ async def _get_sa_field_map() -> dict[str, str]:
     if _sf_label_to_api:
         return _sf_label_to_api
     try:
-        sf = app.state.sf
+        sf = get_salesforce_client()
         meta = await run_in_threadpool(sf.ServiceAppointment.describe)
         _sf_label_to_api = {
             f["label"].lower(): f["name"]
             for f in meta["fields"]
             if f.get("updateable")
         }
-        # Cache picklist values for every picklist/multipicklist field
         for f in meta["fields"]:
             if f.get("type") in ("picklist", "multipicklist") and f.get("picklistValues"):
                 _sf_api_to_picklist[f["name"]] = [v["value"] for v in f["picklistValues"] if v.get("active")]
         log.info("[SF] Field map loaded: %d updateable fields on ServiceAppointment", len(_sf_label_to_api))
-        # Log picklist values for our TQR fields so we can verify exact strings
         tqr_api_names = [
             "Post_Visit_Report_Check__c", "Workmanship1__c", "Decision_Making1__c",
             "Report__c", "Images_Provided__c", "Time_Taken__c", "Signed_SR__c",
@@ -1603,7 +2353,6 @@ async def _get_sa_field_map() -> dict[str, str]:
         for api in tqr_api_names:
             vals = _sf_api_to_picklist.get(api, [])
             log.info("[SF] Picklist %s → %s", api, vals)
-        # Log any field whose label contains "payment" to find the right one
         payment_fields = [(lbl, nm) for lbl, nm in _sf_label_to_api.items() if "payment" in lbl]
         log.info("[SF] Fields with 'payment' in label: %s", payment_fields)
     except Exception as exc:
@@ -1612,7 +2361,7 @@ async def _get_sa_field_map() -> dict[str, str]:
 
 
 async def push_tqr_to_salesforce(appointment_id: str, result: dict[str, Any]) -> None:
-    sf = app.state.sf
+    sf = get_salesforce_client()
     field_map = await _get_sa_field_map()
 
     fields = result.get("tqr_fields") or {}
@@ -1657,11 +2406,9 @@ async def push_tqr_to_salesforce(appointment_id: str, result: dict[str, Any]) ->
     else:
         payment = None
 
-    # Normalise Time Taken — Salesforce only accepts "Excessive", "Ideal", "Rushed"
     time_taken_raw = sf_val("timeTaken") or ""
     time_taken = time_taken_raw.replace(" (severe)", "").strip() or None
 
-    # Keyed by Salesforce field label (lowercase) — we discover the API name at runtime
     label_values: dict[str, Any] = {
         "post visit report check":   verdict or None,
         "workmanship":               sf_val("workmanship"),
@@ -1675,7 +2422,6 @@ async def push_tqr_to_salesforce(appointment_id: str, result: dict[str, Any]) ->
 
     log.info("[SF] Raw values to push: %s", label_values)
 
-    # Map labels → actual API field names using the discovered map
     payload: dict[str, Any] = {}
     missing: list[str] = []
     for label, value in label_values.items():
@@ -1683,7 +2429,6 @@ async def push_tqr_to_salesforce(appointment_id: str, result: dict[str, Any]) ->
             continue
         api_name = field_map.get(label)
         if api_name:
-            # Validate against picklist if applicable
             allowed = _sf_api_to_picklist.get(api_name, [])
             if allowed and value not in allowed:
                 log.warning(
@@ -1697,7 +2442,6 @@ async def push_tqr_to_salesforce(appointment_id: str, result: dict[str, Any]) ->
 
     if missing:
         log.warning("[SF] Could not resolve API names for labels: %s", missing)
-        # Attempt direct API name lookup for known aliases
         alias_map = {
             "payment attempted": "Payment_Attempted__c",
             "images quality": "Images_Provided__c",
@@ -1729,7 +2473,7 @@ async def push_tqr_to_salesforce(appointment_id: str, result: dict[str, Any]) ->
 @app.get("/api/sf-fields/service-appointment")
 async def get_service_appointment_fields():
     """Debug endpoint — returns all writable field names on ServiceAppointment."""
-    sf = app.state.sf
+    sf = get_salesforce_client()
     try:
         meta = await run_in_threadpool(sf.ServiceAppointment.describe)
         writable = [
@@ -1755,7 +2499,6 @@ async def get_tqr_picklist_values():
     for label in tqr_labels:
         api_name = field_map.get(label)
         if not api_name:
-            # Try alias
             alias = {
                 "payment attempted": "Payment_Attempted__c",
                 "images quality": "Images_Provided__c",
@@ -1782,23 +2525,119 @@ async def analyse_appointment(appointment_id: str, force: bool = Query(False)):
     work_order = await fetch_work_order(work_order_id)
     account = await fetch_account(work_order.get("AccountId"))
     images = await fetch_images_for_entity(work_order_id)
+    invoices, documents = [], []
     documents = await fetch_related_documents(appointment, work_order_id)
+    documents.extend(await fetch_direct_url_documents(appointment, work_order_id))
+    invoices = await fetch_invoices_for_context(appointment, work_order_id)
     if not images:
         log.error("[API] No images found for work order %s (appointment %s)", work_order_id, appointment_id)
         raise HTTPException(status_code=400, detail="No image files attached to the related Work Order")
-    result = await run_tqr_analysis(appointment, work_order, account, images, documents)
+    result = await run_tqr_analysis(appointment, work_order, account, images, documents, invoices=invoices)
     saved = await save_analysis_result(appointment_id, result)
     log.info("[API] Analysis saved for %s — verdict=%s overall=%.2f", appointment_id, saved.get("verdict"), saved.get("overall", 0))
-    await push_tqr_to_salesforce(appointment_id, saved)
     return saved
+
+
+RELATED_FORM_OBJECTS = [
+    {"label": "LD Forms",                  "object": "LD_Form__c",                  "woCandidates": ["Work_Order__c", "WorkOrder__c", "Work_Order_Id__c"]},
+    {"label": "Visual Inspection Forms",   "object": "Visual_Inspection_Form__c",   "woCandidates": ["Work_Order__c", "WorkOrder__c"]},
+    {"label": "Damp Survey Forms",         "object": "Damp_Survey_Form__c",         "woCandidates": ["Work_Order__c", "WorkOrder__c"]},
+    {"label": "Drying Forms",              "object": "Drying_Form__c",              "woCandidates": ["Work_Order__c", "WorkOrder__c"]},
+    {"label": "Vent Hygiene Forms",        "object": "Vent_Hygiene_Form__c",        "woCandidates": ["Work_Order__c", "WorkOrder__c"]},
+]
+
+async def _query_related_form(object_name: str, wo_candidates: list[str], work_order_id: str) -> list[dict[str, Any]]:
+    available = await get_object_field_names(object_name)
+    if not available:
+        return []
+    # Pick whichever WO relationship field exists on this object
+    wo_field = next((f for f in wo_candidates if f in available), None)
+    if not wo_field:
+        return []
+    # Build a SELECT with a small set of commonly available fields
+    base_fields = ["Id", "Name", "CreatedDate", "LastModifiedDate"]
+    select_fields = ["Id"] + [f for f in base_fields[1:] if f in available]
+    rows = await sf_query_all_safe(
+        f"SELECT {', '.join(select_fields)} FROM {object_name} WHERE {wo_field} = '{work_order_id}' ORDER BY CreatedDate DESC LIMIT 50"
+    )
+    return [clean_record(r) for r in rows]
+
+
+@app.get("/api/form-records/{object_name}/{record_id}")
+async def get_form_record_detail(object_name: str, record_id: str):
+    """Fetch all queryable fields of a related form record (LD Form, Visual Inspection, etc.)."""
+    select_fields = await get_queryable_fields(object_name)
+    if not select_fields:
+        raise HTTPException(status_code=404, detail="Object not found or no queryable fields")
+    # Salesforce limits SELECT to 200 fields; always include Id first
+    if "Id" in select_fields:
+        select_fields = ["Id"] + [f for f in select_fields if f != "Id"]
+    select_fields = select_fields[:200]
+    soql = f"SELECT {', '.join(select_fields)} FROM {object_name} WHERE Id = '{record_id}' LIMIT 1"
+    log.info("[FormDetail] Querying %s record %s with %d fields", object_name, record_id, len(select_fields))
+    rows = await sf_query_all_safe(soql)
+    if not rows:
+        # Try with just the safe minimal set in case of a field error
+        minimal = ["Id", "Name", "CreatedDate", "LastModifiedDate"]
+        minimal_available = [f for f in minimal if f in set(select_fields)]
+        if minimal_available:
+            rows = await sf_query_all_safe(
+                f"SELECT {', '.join(minimal_available)} FROM {object_name} WHERE Id = '{record_id}' LIMIT 1"
+            )
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Record {record_id} not found in {object_name}")
+    record = clean_record(rows[0])
+    # Format Salesforce datetime strings to UK readable format
+    for key, val in list(record.items()):
+        if isinstance(val, str) and len(val) >= 19 and "T" in val and (val.endswith("Z") or "+00:00" in val):
+            try:
+                dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+                record[key] = dt.astimezone().strftime("%d/%m/%Y %H:%M")
+            except Exception:
+                pass
+        # Remove null-like values
+        if val is None or val == "" or val == "None":
+            record[key] = None
+    return {"record": record, "fields": select_fields, "objectName": object_name}
+
+
+@app.get("/api/appointments/{appointment_id}/related-records")
+async def get_related_records(appointment_id: str):
+    appointment = await fetch_appointment_by_id(appointment_id)
+    work_order_id = resolve_work_order_id(appointment)
+    if not work_order_id:
+        return {"groups": []}
+
+    results = []
+    for cfg in RELATED_FORM_OBJECTS:
+        records = await _query_related_form(cfg["object"], cfg["woCandidates"], work_order_id)
+        results.append({
+            "label": cfg["label"],
+            "object": cfg["object"],
+            "count": len(records),
+            "records": records,
+        })
+
+    return {"groups": results, "workOrderId": work_order_id}
+
+
+@app.post("/api/save-to-salesforce/{appointment_id}")
+async def save_to_salesforce(appointment_id: str, body: dict[str, Any] | None = Body(default=None)):
+    cached = await get_cached_result(appointment_id)
+    result = cached or body
+    if not result:
+        raise HTTPException(status_code=404, detail="No analysed result found for this appointment")
+    await push_tqr_to_salesforce(appointment_id, result)
+    return {"ok": True, "appointmentId": appointment_id, "verdict": result.get("verdict")}
 
 
 @app.get("/api/dashboard/stats")
 async def get_dashboard_stats():
     records = await get_review_queue_records()
     cached = await get_all_cached_results()
-    total_records = len(records)
-    total_charge = round(sum(safe_float(record.get("CCT_Charge_Gross__c")) for record in records), 2)
+    unchecked = [record for record in records if not record.get("Post_Visit_Report_Check__c")]
+    total_records = len(unchecked)
+    total_charge = round(sum(safe_float(record.get("CCT_Charge_Gross__c")) for record in unchecked), 2)
     scored = [result["overall"] for result in cached.values() if result.get("overall") is not None]
     avg_tqr = round(sum(scored) / len(scored), 2) if scored else None
 
@@ -1808,7 +2647,7 @@ async def get_dashboard_stats():
     low_score_jobs: list[dict[str, Any]] = []
     top_engineers_acc: dict[str, list[float]] = {}
 
-    for record in records:
+    for record in unchecked:
         trade_group = record.get("Trade_Group_Region__c") or record.get("Trade_Group_Postcode__c") or record.get("Scheduled_Trade__c") or "Unknown"
         status = record.get("Status") or "Unknown"
         sector = record.get("Sector_Type__c") or "Unknown"

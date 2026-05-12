@@ -18,12 +18,23 @@ const api = axios.create({ baseURL: 'http://localhost:8000' })
 type View = 'dashboard' | 'appointments' | 'appointment-detail' | 'engineers' | 'engineer-detail' | 'tqr-report'
 type Nullable<T> = T | null
 
+// ── NEW: Document type ────────────────────────────────────────────────────
+type RelatedDocument = {
+  id: string
+  title: string
+  fileType: string
+  contentType: string
+  source: string
+  category: 'invoice' | 'payment' | 'service-report' | 'document'
+  externalUrl?: string
+}
+
 type TqrResult = {
   appointment_id?: string
   workmanship: number
   cleanliness: number
   safety: number
-  completion: number  
+  completion: number
   overall: number
   summary: string
   flags: string[]
@@ -71,6 +82,7 @@ type Appointment = {
   account?: { Id: string; Name: string; Phone?: string }
   site?: string
   accountManager?: string
+  documents?: RelatedDocument[]   // ← NEW
 }
 
 type DashboardStats = {
@@ -115,21 +127,103 @@ const scoreTone = (score?: number | null) => {
 
 const statusTone = (status?: string) => {
   switch (status) {
-    case 'Visit Complete':
-      return 'bg-emerald-500/15 text-emerald-300 border-emerald-400/40'
-    case 'Scheduled':
-      return 'bg-sky-500/15 text-sky-200 border-sky-400/40'
-    case 'Cancelled':
-      return 'bg-rose-500/15 text-rose-200 border-rose-400/40'
-    case 'In Progress':
-      return 'bg-amber-500/15 text-amber-200 border-amber-400/40'
-    default:
-      return 'bg-slate-700/70 text-slate-200 border-slate-600'
+    case 'Visit Complete': return 'bg-emerald-500/15 text-emerald-300 border-emerald-400/40'
+    case 'Scheduled':      return 'bg-sky-500/15 text-sky-200 border-sky-400/40'
+    case 'Cancelled':      return 'bg-rose-500/15 text-rose-200 border-rose-400/40'
+    case 'In Progress':    return 'bg-amber-500/15 text-amber-200 border-amber-400/40'
+    default:               return 'bg-slate-700/70 text-slate-200 border-slate-600'
   }
 }
 
 const chartPalette = ['#38bdf8', '#2dd4bf', '#f59e0b', '#f43f5e', '#8b5cf6', '#22c55e', '#e879f9']
 
+// ── Helpers ────────────────────────────────────────────────────────────────
+/** Build the URL used to open/proxy a document */
+const documentOpenUrl = (doc: RelatedDocument): string => {
+  if (doc.externalUrl) {
+    return `http://localhost:8000/api/proxy-sf-url?url=${encodeURIComponent(doc.externalUrl)}`
+  }
+  return `http://localhost:8000/api/content/${doc.id}?inline=true`
+}
+
+const categoryLabel: Record<string, string> = {
+  invoice:        'Invoice',
+  payment:        'Payment',
+  'service-report': 'Service Report',
+  document:       'Document',
+}
+
+const categoryBadgeClass: Record<string, string> = {
+  invoice:          'bg-violet-500/15 text-violet-300 border-violet-400/40',
+  payment:          'bg-teal-500/15 text-teal-300 border-teal-400/40',
+  'service-report': 'bg-sky-500/15 text-sky-300 border-sky-400/40',
+  document:         'bg-slate-700/70 text-slate-300 border-slate-600',
+}
+
+// ── NEW: RelatedDocuments component ───────────────────────────────────────
+const RelatedDocuments = ({ documents }: { documents: RelatedDocument[] }) => {
+  if (!documents || documents.length === 0) return null
+
+  // Group by category
+  const grouped = documents.reduce<Record<string, RelatedDocument[]>>((acc, doc) => {
+    const cat = doc.category || 'document'
+    if (!acc[cat]) acc[cat] = []
+    acc[cat].push(doc)
+    return acc
+  }, {})
+
+  return (
+    <div className={cardClass}>
+      <div className="mb-4 flex items-center gap-3">
+        <span className={sectionTitleClass}>Related Documents</span>
+        <span className="flex h-6 w-6 items-center justify-center rounded-full bg-slate-700 text-xs font-bold text-slate-200">
+          {documents.length}
+        </span>
+      </div>
+
+      <div className="space-y-5">
+        {Object.entries(grouped).map(([cat, docs]) => (
+          <div key={cat}>
+            <div className="mb-2 text-xs font-semibold uppercase tracking-[0.25em] text-slate-500">
+              {categoryLabel[cat] ?? cat}
+            </div>
+            <div className="space-y-2">
+              {docs.map((doc) => (
+                <div
+                  key={doc.id}
+                  className="flex items-center justify-between rounded-xl border border-slate-800 bg-slate-950/60 px-4 py-3"
+                >
+                  <div className="flex items-center gap-3">
+                    {/* File type badge */}
+                    <span className={`inline-flex rounded border px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ${categoryBadgeClass[doc.category] ?? categoryBadgeClass.document}`}>
+                      {doc.fileType?.toUpperCase() || 'FILE'}
+                    </span>
+                    <div>
+                      <div className="text-sm font-semibold text-slate-100">{doc.title}</div>
+                      <div className="text-xs text-slate-500">
+                        {categoryLabel[doc.category] ?? doc.category} · {doc.source}
+                      </div>
+                    </div>
+                  </div>
+                  <a
+                    href={documentOpenUrl(doc)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="rounded-xl bg-slate-700 px-4 py-2 text-xs font-semibold text-white transition hover:bg-slate-600"
+                  >
+                    Open
+                  </a>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// ── Existing shared components (unchanged) ────────────────────────────────
 const StatCard = ({ label, value, accent }: { label: string; value: string; accent: string }) => (
   <div className={`${cardClass} relative overflow-hidden`}>
     <div className={`absolute inset-x-0 top-0 h-1 ${accent}`} />
@@ -316,25 +410,14 @@ const useAppointments = () => {
   }, [filters.search, filters.status, filters.engineer, filters.trade])
 
   return {
-    appointments,
-    loading,
-    page,
-    pageSize,
-    totalPages,
-    total,
-    filters,
-    setFilters,
-    fetchAppointments,
-    setPage,
-    setPageSize,
+    appointments, loading, page, pageSize, totalPages, total,
+    filters, setFilters, fetchAppointments, setPage, setPageSize,
   }
 }
 
+// ── DashboardView (unchanged) ─────────────────────────────────────────────
 const DashboardView = ({
-  stats,
-  recentAppointments,
-  onOpenAppointment,
-  onOpenModal,
+  stats, recentAppointments, onOpenAppointment, onOpenModal,
 }: {
   stats: DashboardStats | null
   recentAppointments: Appointment[]
@@ -343,10 +426,10 @@ const DashboardView = ({
 }) => (
   <div className="space-y-8">
     <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-      <StatCard label="Total Records" value={`${stats?.totalRecords ?? 0}`} accent="bg-sky-400" />
-      <StatCard label="Total CCT Charge £" value={formatMoney(stats?.totalCCTCharge)} accent="bg-teal-400" />
-      <StatCard label="Avg TQR Score" value={stats?.avgTQRScore?.toFixed(1) ?? 'N/A'} accent="bg-amber-400" />
-      <StatCard label="Flagged Jobs" value={`${stats?.lowScoreJobs.length ?? 0}`} accent="bg-rose-400" />
+      <StatCard label="Total Records"    value={`${stats?.totalRecords ?? 0}`}              accent="bg-sky-400" />
+      <StatCard label="Total CCT Charge" value={formatMoney(stats?.totalCCTCharge)}         accent="bg-teal-400" />
+      <StatCard label="Avg TQR Score"    value={stats?.avgTQRScore?.toFixed(1) ?? 'N/A'}    accent="bg-amber-400" />
+      <StatCard label="Flagged Jobs"     value={`${stats?.lowScoreJobs.length ?? 0}`}       accent="bg-rose-400" />
     </div>
 
     <div className="grid gap-6 xl:grid-cols-2">
@@ -430,12 +513,9 @@ const DashboardView = ({
   </div>
 )
 
+// ── AppointmentsView (unchanged) ──────────────────────────────────────────
 const AppointmentsView = ({
-  appointmentsState,
-  onOpenAppointment,
-  onOpenModal,
-  onAnalyse,
-  analysingIds,
+  appointmentsState, onOpenAppointment, onOpenModal, onAnalyse, analysingIds,
 }: {
   appointmentsState: ReturnType<typeof useAppointments>
   onOpenAppointment: (id: string) => void
@@ -444,26 +524,25 @@ const AppointmentsView = ({
   analysingIds: string[]
 }) => {
   const { appointments, loading, page, pageSize, totalPages, total, filters, setFilters, fetchAppointments } = appointmentsState
-
-  const engineers = Array.from(new Set(appointments.map((item) => item.Allocated_Engineer__c).filter(Boolean))) as string[]
-  const tradeGroups = Array.from(new Set(appointments.flatMap((item) => [item.Scheduled_Trade__c, item.Trade_Group_Postcode__c]).filter(Boolean))) as string[]
-  const statuses = ['Visit Complete', 'Scheduled', 'Cancelled', 'In Progress']
+  const engineers    = Array.from(new Set(appointments.map((a) => a.Allocated_Engineer__c).filter(Boolean))) as string[]
+  const tradeGroups  = Array.from(new Set(appointments.flatMap((a) => [a.Scheduled_Trade__c, a.Trade_Group_Postcode__c]).filter(Boolean))) as string[]
+  const statuses     = ['Visit Complete', 'Scheduled', 'Cancelled', 'In Progress']
 
   return (
     <div className="space-y-6">
       <div className={`${cardClass} grid gap-4 xl:grid-cols-4`}>
-        <input className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-slate-100 outline-none" placeholder="Search appointments, engineer or trade" value={filters.search} onChange={(e) => setFilters((prev) => ({ ...prev, search: e.target.value }))} />
-        <select className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-slate-100 outline-none" value={filters.status} onChange={(e) => setFilters((prev) => ({ ...prev, status: e.target.value }))}>
+        <input className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-slate-100 outline-none" placeholder="Search appointments, engineer or trade" value={filters.search} onChange={(e) => setFilters((p) => ({ ...p, search: e.target.value }))} />
+        <select className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-slate-100 outline-none" value={filters.status} onChange={(e) => setFilters((p) => ({ ...p, status: e.target.value }))}>
           <option value="">All Statuses</option>
-          {statuses.map((status) => <option key={status} value={status}>{status}</option>)}
+          {statuses.map((s) => <option key={s} value={s}>{s}</option>)}
         </select>
-        <select className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-slate-100 outline-none" value={filters.engineer} onChange={(e) => setFilters((prev) => ({ ...prev, engineer: e.target.value }))}>
+        <select className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-slate-100 outline-none" value={filters.engineer} onChange={(e) => setFilters((p) => ({ ...p, engineer: e.target.value }))}>
           <option value="">All Engineers</option>
-          {engineers.map((engineer) => <option key={engineer} value={engineer}>{engineer}</option>)}
+          {engineers.map((e) => <option key={e} value={e}>{e}</option>)}
         </select>
-        <select className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-slate-100 outline-none" value={filters.trade} onChange={(e) => setFilters((prev) => ({ ...prev, trade: e.target.value }))}>
+        <select className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-slate-100 outline-none" value={filters.trade} onChange={(e) => setFilters((p) => ({ ...p, trade: e.target.value }))}>
           <option value="">All Trade Groups</option>
-          {tradeGroups.map((trade) => <option key={trade} value={trade}>{trade}</option>)}
+          {tradeGroups.map((t) => <option key={t} value={t}>{t}</option>)}
         </select>
       </div>
 
@@ -490,19 +569,16 @@ const AppointmentsView = ({
               {appointments.map((appt) => (
                 <tr key={appt.Id} className="border-t border-slate-800 text-slate-200 hover:bg-slate-800/50">
                   <td className="py-3">
-                    <button
-                      className="font-semibold text-cyan-400 underline underline-offset-2 hover:text-cyan-200"
-                      onClick={() => onOpenModal(appt.Id)}
-                    >
+                    <button className="font-semibold text-cyan-400 underline underline-offset-2 hover:text-cyan-200" onClick={() => onOpenModal(appt.Id)}>
                       {appt.AppointmentNumber || 'N/A'}
                     </button>
                   </td>
-                  <td className="py-3 cursor-pointer" onClick={() => onOpenAppointment(appt.Id)}>{appt.Allocated_Engineer__c || 'Unassigned'}</td>
-                  <td className="py-3 cursor-pointer" onClick={() => onOpenAppointment(appt.Id)}><StatusBadge status={appt.Status} /></td>
-                  <td className="py-3 cursor-pointer" onClick={() => onOpenAppointment(appt.Id)}>{appt.Scheduled_Trade__c || appt.Trade_Group_Postcode__c || 'N/A'}</td>
-                  <td className="py-3 cursor-pointer" onClick={() => onOpenAppointment(appt.Id)}>{formatDateTime(appt.ActualEndTimeFormatted)}</td>
-                  <td className="py-3 cursor-pointer" onClick={() => onOpenAppointment(appt.Id)}>{formatMoney(appt.CCT_Charge_Gross__c)}</td>
-                  <td className="py-3 cursor-pointer" onClick={() => onOpenAppointment(appt.Id)}><TQRScoreBadge score={appt.tqrScore} /></td>
+                  <td className="cursor-pointer py-3" onClick={() => onOpenAppointment(appt.Id)}>{appt.Allocated_Engineer__c || 'Unassigned'}</td>
+                  <td className="cursor-pointer py-3" onClick={() => onOpenAppointment(appt.Id)}><StatusBadge status={appt.Status} /></td>
+                  <td className="cursor-pointer py-3" onClick={() => onOpenAppointment(appt.Id)}>{appt.Scheduled_Trade__c || appt.Trade_Group_Postcode__c || 'N/A'}</td>
+                  <td className="cursor-pointer py-3" onClick={() => onOpenAppointment(appt.Id)}>{formatDateTime(appt.ActualEndTimeFormatted)}</td>
+                  <td className="cursor-pointer py-3" onClick={() => onOpenAppointment(appt.Id)}>{formatMoney(appt.CCT_Charge_Gross__c)}</td>
+                  <td className="cursor-pointer py-3" onClick={() => onOpenAppointment(appt.Id)}><TQRScoreBadge score={appt.tqrScore} /></td>
                   <td className="py-3">
                     <button
                       className="rounded-xl border border-cyan-400/30 bg-cyan-400/10 px-4 py-2 text-xs font-semibold text-cyan-200 disabled:cursor-not-allowed disabled:opacity-40"
@@ -527,10 +603,9 @@ const AppointmentsView = ({
   )
 }
 
+// ── AppointmentDetailView — UPDATED ───────────────────────────────────────
 const AppointmentDetailView = ({
-  id,
-  onBack,
-  onOpenEngineer,
+  id, onBack, onOpenEngineer,
 }: {
   id: string
   onBack: () => void
@@ -538,27 +613,47 @@ const AppointmentDetailView = ({
 }) => {
   const [appointment, setAppointment] = useState<Appointment | null>(null)
   const [images, setImages] = useState<AppointmentImage[]>([])
+  const [documents, setDocuments] = useState<RelatedDocument[]>([])
   const [loading, setLoading] = useState(true)
+  const [docsLoading, setDocsLoading] = useState(false)
   const [analysing, setAnalysing] = useState(false)
   const [analysis, setAnalysis] = useState<TqrResult | null>(null)
 
   const loadDetail = async () => {
     setLoading(true)
     try {
-      const [{ data: appointmentData }, { data: imageData }] = await Promise.all([
-        api.get(`/api/appointments/${id}`),
-        api.get(`/api/appointments/${id}/images`),
-      ])
-      setAppointment(appointmentData)
-      setAnalysis(appointmentData.tqrResult ?? null)
-      setImages(imageData.images ?? [])
+      // ── FIX: use the correct work-orders images endpoint ─────────────
+      const { data: apptData } = await api.get<Appointment>(`/api/appointments/${id}`)
+      setAppointment(apptData)
+      setAnalysis(apptData.tqrResult ?? null)
+
+      // Images come from the work order, not the appointment
+      const woId = apptData.workOrderId
+      if (woId) {
+        const { data: imgData } = await api.get<{ images: AppointmentImage[] }>(`/api/work-orders/${woId}/images`)
+        setImages(imgData.images ?? [])
+      }
     } finally {
       setLoading(false)
     }
   }
 
+  const loadDocuments = async () => {
+    setDocsLoading(true)
+    try {
+      // ── NEW: dedicated documents endpoint ────────────────────────────
+      const { data } = await api.get<{ documents: RelatedDocument[] }>(`/api/appointments/${id}/documents`)
+      setDocuments(data.documents ?? [])
+    } catch (err) {
+      console.error('Failed to load documents', err)
+    } finally {
+      setDocsLoading(false)
+    }
+  }
+
   useEffect(() => {
     void loadDetail()
+    void loadDocuments()
   }, [id])
 
   const runAnalysis = async () => {
@@ -577,29 +672,43 @@ const AppointmentDetailView = ({
 
   return (
     <div className="space-y-6">
-      <button className="rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200" onClick={onBack}>Back</button>
+      <button className="rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200" onClick={onBack}>← Back</button>
 
+      {/* ── Appointment meta grid ────────────────────────────────────── */}
       <div className={`${cardClass} grid gap-4 md:grid-cols-3`}>
-        <DetailItem label="Booking Details" value={`${appointment.AppointmentNumber || 'N/A'} | ${appointment.Status || 'Unknown'} | ${appointment.Subject || 'N/A'}`} />
-        <DetailItem label="Arrival & Timing" value={`${formatDateTime(appointment.SchedStartTimeFormatted)} | ${formatDateTime(appointment.ArrivalWindowStartTimeFormatted)} | ${formatDateTime(appointment.ActualEndTimeFormatted)} | ${appointment.Duration || 0} mins`} />
+        <DetailItem label="Booking Details"    value={`${appointment.AppointmentNumber || 'N/A'} | ${appointment.Status || 'Unknown'} | ${appointment.Subject || 'N/A'}`} />
+        <DetailItem label="Arrival & Timing"   value={`${formatDateTime(appointment.SchedStartTimeFormatted)} | ${formatDateTime(appointment.ArrivalWindowStartTimeFormatted)} | ${formatDateTime(appointment.ActualEndTimeFormatted)} | ${appointment.Duration || 0} mins`} />
         <DetailItem label="Address & Customer" value={`${appointment.Street || ''}, ${appointment.City || ''}, ${appointment.PostalCode || ''} | ${appointment.AccountId || 'N/A'}`} />
-        <DetailItem label="Scope of Works" value={appointment.Description} />
+        <DetailItem label="Scope of Works"     value={appointment.Description} />
         <DetailItem label="Allocated Engineer" value={appointment.Allocated_Engineer__c || 'Unassigned'} />
-        <DetailItem label="Attendance Report" value={appointment.Attendance_Report_for_Customer__c} />
-        <DetailItem label="Feedback Notes" value={appointment.Feedback_Notes__c} />
-        <DetailItem label="Charges & Invoice" value={formatMoney(appointment.CCT_Charge_Gross__c)} />
+        <DetailItem label="Attendance Report"  value={appointment.Attendance_Report_for_Customer__c} />
+        <DetailItem label="Feedback Notes"     value={appointment.Feedback_Notes__c} />
+        <DetailItem label="Charges & Invoice"  value={formatMoney(appointment.CCT_Charge_Gross__c)} />
         <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
           <div className="text-xs uppercase tracking-[0.25em] text-slate-500">Engineer Drilldown</div>
-          <button className="mt-3 rounded-xl border border-cyan-400/30 bg-cyan-400/10 px-4 py-2 text-sm text-cyan-200" onClick={() => appointment.Allocated_Engineer__c && onOpenEngineer(appointment.Allocated_Engineer__c)}>
+          <button
+            className="mt-3 rounded-xl border border-cyan-400/30 bg-cyan-400/10 px-4 py-2 text-sm text-cyan-200"
+            onClick={() => appointment.Allocated_Engineer__c && onOpenEngineer(appointment.Allocated_Engineer__c)}
+          >
             Open Engineer Detail
           </button>
         </div>
       </div>
 
+      {/* ── Related Documents ────────────────────────────────────────── */}
+      {docsLoading ? (
+        <div className={cardClass}>
+          <div className="text-sm text-slate-400">Loading related documents…</div>
+        </div>
+      ) : (
+        <RelatedDocuments documents={documents} />
+      )}
+
+      {/* ── TQR / Images ────────────────────────────────────────────── */}
       <div className={cardClass}>
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div>
-            <div className={sectionTitleClass}>TQR Check - AI Analysis</div>
+            <div className={sectionTitleClass}>TQR Check — AI Analysis</div>
             <div className="mt-2 text-sm text-slate-400">{images.length} site images available</div>
           </div>
           <button
@@ -607,7 +716,7 @@ const AppointmentDetailView = ({
             onClick={() => void runAnalysis()}
             disabled={analysing || Boolean(analysis)}
           >
-            {analysis ? 'Already Analysed' : analysing ? 'Analysing...' : 'Run TQR Analysis'}
+            {analysis ? 'Already Analysed' : analysing ? 'Analysing…' : 'Run TQR Analysis'}
           </button>
         </div>
 
@@ -615,15 +724,15 @@ const AppointmentDetailView = ({
           <ImageGallery images={images} />
         </div>
 
-        {analysing && <div className="mt-6 text-sm text-cyan-200">Running TQR image analysis...</div>}
+        {analysing && <div className="mt-6 text-sm text-cyan-200">Running TQR image analysis…</div>}
 
         {analysis && (
           <div className="mt-8 space-y-6">
             <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
               <TQRScoreGauge label="Workmanship" score={analysis.workmanship} />
               <TQRScoreGauge label="Cleanliness" score={analysis.cleanliness} />
-              <TQRScoreGauge label="Safety" score={analysis.safety} />
-              <TQRScoreGauge label="Completion" score={analysis.completion} />
+              <TQRScoreGauge label="Safety"      score={analysis.safety} />
+              <TQRScoreGauge label="Completion"  score={analysis.completion} />
             </div>
             <div className="flex flex-wrap items-center gap-4">
               <TQRScoreBadge score={analysis.overall} />
@@ -649,18 +758,12 @@ const AppointmentDetailView = ({
   )
 }
 
-const EngineersView = ({
-  engineers,
-  onOpenEngineer,
-}: {
-  engineers: EngineerSummary[]
-  onOpenEngineer: (name: string) => void
-}) => (
+// ── EngineersView (unchanged) ─────────────────────────────────────────────
+const EngineersView = ({ engineers, onOpenEngineer }: { engineers: EngineerSummary[]; onOpenEngineer: (name: string) => void }) => (
   <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
     {engineers.map((engineer) => {
       const score = engineer.avgTQRScore
-      const border =
-        score === null ? 'border-slate-700' : score >= 8 ? 'border-emerald-400/50' : score >= 5 ? 'border-amber-400/50' : 'border-rose-400/50'
+      const border = score === null ? 'border-slate-700' : score >= 8 ? 'border-emerald-400/50' : score >= 5 ? 'border-amber-400/50' : 'border-rose-400/50'
       const passRate = engineer.totalJobs ? `${Math.round((engineer.completedJobs / engineer.totalJobs) * 100)}%` : '0%'
       return (
         <button key={engineer.name} className={`${cardClass} ${border} text-left`} onClick={() => onOpenEngineer(engineer.name)}>
@@ -677,37 +780,31 @@ const EngineersView = ({
   </div>
 )
 
+// ── EngineerDetailView (unchanged) ────────────────────────────────────────
 const EngineerDetailView = ({
-  name,
-  appointments,
-  onBack,
-  onOpenAppointment,
+  name, appointments, onBack, onOpenAppointment,
 }: {
   name: string
   appointments: Appointment[]
   onBack: () => void
   onOpenAppointment: (id: string) => void
 }) => {
-  const engineerAppointments = appointments.filter((item) => item.Allocated_Engineer__c === name)
+  const engineerAppointments = appointments.filter((a) => a.Allocated_Engineer__c === name)
   const chartData = engineerAppointments
-    .filter((item) => item.tqrScore !== null && item.tqrScore !== undefined)
-    .map((item) => ({
-      date: item.ActualEndTimeFormatted || item.AppointmentNumber || 'Job',
-      score: item.tqrScore,
-    }))
+    .filter((a) => a.tqrScore !== null && a.tqrScore !== undefined)
+    .map((a) => ({ date: a.ActualEndTimeFormatted || a.AppointmentNumber || 'Job', score: a.tqrScore }))
     .reverse()
-
-  const totalRevenue = engineerAppointments.reduce((sum, item) => sum + (item.CCT_Charge_Gross__c || 0), 0)
-  const average = chartData.length ? chartData.reduce((sum, item) => sum + (item.score || 0), 0) / chartData.length : null
+  const totalRevenue = engineerAppointments.reduce((s, a) => s + (a.CCT_Charge_Gross__c || 0), 0)
+  const average = chartData.length ? chartData.reduce((s, a) => s + (a.score || 0), 0) / chartData.length : null
 
   return (
     <div className="space-y-6">
-      <button className="rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200" onClick={onBack}>Back</button>
+      <button className="rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200" onClick={onBack}>← Back</button>
       <div className="grid gap-4 md:grid-cols-4">
-        <StatCard label="Engineer" value={name} accent="bg-cyan-400" />
+        <StatCard label="Engineer"  value={name}                         accent="bg-cyan-400" />
         <StatCard label="Total Jobs" value={`${engineerAppointments.length}`} accent="bg-teal-400" />
-        <StatCard label="Avg TQR" value={average?.toFixed(1) ?? 'N/A'} accent="bg-amber-400" />
-        <StatCard label="Revenue" value={formatMoney(totalRevenue)} accent="bg-emerald-400" />
+        <StatCard label="Avg TQR"   value={average?.toFixed(1) ?? 'N/A'} accent="bg-amber-400" />
+        <StatCard label="Revenue"   value={formatMoney(totalRevenue)}    accent="bg-emerald-400" />
       </div>
       <div className={cardClass}>
         <div className={sectionTitleClass}>TQR Score Trend Over Time</div>
@@ -729,12 +826,8 @@ const EngineerDetailView = ({
           <table className="min-w-full text-left text-sm">
             <thead className="text-slate-400">
               <tr>
-                <th className="pb-3">Appt No</th>
-                <th className="pb-3">Status</th>
-                <th className="pb-3">Trade</th>
-                <th className="pb-3">Actual End</th>
-                <th className="pb-3">Charge</th>
-                <th className="pb-3">Score</th>
+                <th className="pb-3">Appt No</th><th className="pb-3">Status</th><th className="pb-3">Trade</th>
+                <th className="pb-3">Actual End</th><th className="pb-3">Charge</th><th className="pb-3">Score</th>
               </tr>
             </thead>
             <tbody>
@@ -756,69 +849,49 @@ const EngineerDetailView = ({
   )
 }
 
+// ── TQRReportView (unchanged) ─────────────────────────────────────────────
 const TQRReportView = ({
-  appointments,
-  onAnalyse,
-  analysingIds,
+  appointments, onAnalyse, analysingIds,
 }: {
   appointments: Appointment[]
   onAnalyse: (id: string) => Promise<void>
   analysingIds: string[]
 }) => {
   const [engineerFilter, setEngineerFilter] = useState('')
-  const [tradeFilter, setTradeFilter] = useState('')
-  const [scoreRange, setScoreRange] = useState('')
-  const [batchProgress, setBatchProgress] = useState(0)
+  const [tradeFilter, setTradeFilter]       = useState('')
+  const [scoreRange, setScoreRange]         = useState('')
+  const [batchProgress, setBatchProgress]   = useState(0)
 
-  const analysedJobs = useMemo(() => appointments.filter((item) => item.tqrResult), [appointments])
-  const filtered = analysedJobs.filter((item) => {
-    const score = item.tqrScore ?? -1
-    const scoreMatch =
-      !scoreRange ||
-      (scoreRange === 'high' && score >= 8) ||
-      (scoreRange === 'mid' && score >= 5 && score < 8) ||
-      (scoreRange === 'low' && score < 5)
-    const engineerMatch = !engineerFilter || item.Allocated_Engineer__c === engineerFilter
-    const tradeMatch = !tradeFilter || item.Trade_Group_Postcode__c === tradeFilter || item.Scheduled_Trade__c === tradeFilter
+  const analysedJobs = useMemo(() => appointments.filter((a) => a.tqrResult), [appointments])
+  const filtered = analysedJobs.filter((a) => {
+    const score = a.tqrScore ?? -1
+    const scoreMatch    = !scoreRange || (scoreRange === 'high' && score >= 8) || (scoreRange === 'mid' && score >= 5 && score < 8) || (scoreRange === 'low' && score < 5)
+    const engineerMatch = !engineerFilter || a.Allocated_Engineer__c === engineerFilter
+    const tradeMatch    = !tradeFilter || a.Trade_Group_Postcode__c === tradeFilter || a.Scheduled_Trade__c === tradeFilter
     return scoreMatch && engineerMatch && tradeMatch
   })
 
   const exportCsv = () => {
     const rows = [
-      ['Appointment', 'Engineer', 'Trade Group', 'Workmanship', 'Cleanliness', 'Safety', 'Completion', 'Overall'],
-      ...filtered.map((item) => [
-        item.AppointmentNumber || '',
-        item.Allocated_Engineer__c || '',
-        item.Trade_Group_Postcode__c || item.Scheduled_Trade__c || '',
-        item.tqrResult?.workmanship?.toString() || '',
-        item.tqrResult?.cleanliness?.toString() || '',
-        item.tqrResult?.safety?.toString() || '',
-        item.tqrResult?.completion?.toString() || '',
-        item.tqrResult?.overall?.toString() || '',
-      ]),
+      ['Appointment','Engineer','Trade Group','Workmanship','Cleanliness','Safety','Completion','Overall'],
+      ...filtered.map((a) => [a.AppointmentNumber||'', a.Allocated_Engineer__c||'', a.Trade_Group_Postcode__c||a.Scheduled_Trade__c||'',
+        a.tqrResult?.workmanship?.toString()||'', a.tqrResult?.cleanliness?.toString()||'', a.tqrResult?.safety?.toString()||'',
+        a.tqrResult?.completion?.toString()||'', a.tqrResult?.overall?.toString()||'']),
     ]
-    const csv = rows.map((row) => row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(',')).join('\n')
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = 'chumley-tqr-report.csv'
-    link.click()
-    URL.revokeObjectURL(url)
+    const csv  = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g,'""')}"`).join(',')).join('\n')
+    const url  = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8;' }))
+    const link = Object.assign(document.createElement('a'), { href: url, download: 'chumley-tqr-report.csv' })
+    link.click(); URL.revokeObjectURL(url)
   }
 
   const analyseAllUnscored = async () => {
-    const targets = appointments.filter((item) => !item.tqrResult)
-    let completed = 0
-    for (const item of targets) {
-      await onAnalyse(item.Id)
-      completed += 1
-      setBatchProgress(Math.round((completed / targets.length) * 100))
-    }
+    const targets = appointments.filter((a) => !a.tqrResult)
+    let done = 0
+    for (const a of targets) { await onAnalyse(a.Id); setBatchProgress(Math.round((++done / targets.length) * 100)) }
   }
 
-  const engineerOptions = Array.from(new Set(appointments.map((item) => item.Allocated_Engineer__c).filter(Boolean))) as string[]
-  const tradeOptions = Array.from(new Set(appointments.flatMap((item) => [item.Trade_Group_Postcode__c, item.Scheduled_Trade__c]).filter(Boolean))) as string[]
+  const engineerOptions = Array.from(new Set(appointments.map((a) => a.Allocated_Engineer__c).filter(Boolean))) as string[]
+  const tradeOptions    = Array.from(new Set(appointments.flatMap((a) => [a.Trade_Group_Postcode__c, a.Scheduled_Trade__c]).filter(Boolean))) as string[]
 
   return (
     <div className="space-y-6">
@@ -831,16 +904,14 @@ const TQRReportView = ({
         </select>
         <select className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-slate-100" value={engineerFilter} onChange={(e) => setEngineerFilter(e.target.value)}>
           <option value="">All Engineers</option>
-          {engineerOptions.map((item) => <option key={item} value={item}>{item}</option>)}
+          {engineerOptions.map((e) => <option key={e} value={e}>{e}</option>)}
         </select>
         <select className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-slate-100" value={tradeFilter} onChange={(e) => setTradeFilter(e.target.value)}>
           <option value="">All Trade Groups</option>
-          {tradeOptions.map((item) => <option key={item} value={item}>{item}</option>)}
+          {tradeOptions.map((t) => <option key={t} value={t}>{t}</option>)}
         </select>
         <button className="rounded-xl border border-cyan-400/30 bg-cyan-400/10 px-4 py-3 text-sm font-semibold text-cyan-200" onClick={exportCsv}>Export CSV</button>
-        <button className="rounded-xl border border-emerald-400/30 bg-emerald-400/10 px-4 py-3 text-sm font-semibold text-emerald-200" onClick={() => void analyseAllUnscored()}>
-          Analyse All Unscored
-        </button>
+        <button className="rounded-xl border border-emerald-400/30 bg-emerald-400/10 px-4 py-3 text-sm font-semibold text-emerald-200" onClick={() => void analyseAllUnscored()}>Analyse All Unscored</button>
       </div>
 
       <div className={cardClass}>
@@ -855,27 +926,22 @@ const TQRReportView = ({
           <table className="min-w-full text-left text-sm">
             <thead className="text-slate-400">
               <tr>
-                <th className="pb-3">Appt No</th>
-                <th className="pb-3">Engineer</th>
-                <th className="pb-3">Trade Group</th>
-                <th className="pb-3">Workmanship</th>
-                <th className="pb-3">Cleanliness</th>
-                <th className="pb-3">Safety</th>
-                <th className="pb-3">Completion</th>
-                <th className="pb-3">Overall</th>
+                <th className="pb-3">Appt No</th><th className="pb-3">Engineer</th><th className="pb-3">Trade Group</th>
+                <th className="pb-3">Workmanship</th><th className="pb-3">Cleanliness</th>
+                <th className="pb-3">Safety</th><th className="pb-3">Completion</th><th className="pb-3">Overall</th>
               </tr>
             </thead>
             <tbody>
-              {filtered.map((item) => (
-                <tr key={item.Id} className="border-t border-slate-800 text-slate-200">
-                  <td className="py-3">{item.AppointmentNumber || 'N/A'}</td>
-                  <td className="py-3">{item.Allocated_Engineer__c || 'Unassigned'}</td>
-                  <td className="py-3">{item.Trade_Group_Postcode__c || item.Scheduled_Trade__c || 'N/A'}</td>
-                  <td className="py-3"><TQRScoreBadge score={item.tqrResult?.workmanship} /></td>
-                  <td className="py-3"><TQRScoreBadge score={item.tqrResult?.cleanliness} /></td>
-                  <td className="py-3"><TQRScoreBadge score={item.tqrResult?.safety} /></td>
-                  <td className="py-3"><TQRScoreBadge score={item.tqrResult?.completion} /></td>
-                  <td className="py-3"><TQRScoreBadge score={item.tqrResult?.overall} /></td>
+              {filtered.map((a) => (
+                <tr key={a.Id} className="border-t border-slate-800 text-slate-200">
+                  <td className="py-3">{a.AppointmentNumber || 'N/A'}</td>
+                  <td className="py-3">{a.Allocated_Engineer__c || 'Unassigned'}</td>
+                  <td className="py-3">{a.Trade_Group_Postcode__c || a.Scheduled_Trade__c || 'N/A'}</td>
+                  <td className="py-3"><TQRScoreBadge score={a.tqrResult?.workmanship} /></td>
+                  <td className="py-3"><TQRScoreBadge score={a.tqrResult?.cleanliness} /></td>
+                  <td className="py-3"><TQRScoreBadge score={a.tqrResult?.safety} /></td>
+                  <td className="py-3"><TQRScoreBadge score={a.tqrResult?.completion} /></td>
+                  <td className="py-3"><TQRScoreBadge score={a.tqrResult?.overall} /></td>
                 </tr>
               ))}
             </tbody>
@@ -886,63 +952,52 @@ const TQRReportView = ({
   )
 }
 
+// ── Root App (unchanged structure) ────────────────────────────────────────
 export default function Dashboard() {
-  const [view, setView] = useState<View>('dashboard')
-  const [selectedId, setSelectedId] = useState<Nullable<string>>(null)
+  const [view, setView]                     = useState<View>('dashboard')
+  const [selectedId, setSelectedId]         = useState<Nullable<string>>(null)
   const [selectedEngineer, setSelectedEngineer] = useState<Nullable<string>>(null)
-  const [stats, setStats] = useState<DashboardStats | null>(null)
-  const [engineers, setEngineers] = useState<EngineerSummary[]>([])
+  const [stats, setStats]                   = useState<DashboardStats | null>(null)
+  const [engineers, setEngineers]           = useState<EngineerSummary[]>([])
   const [recentAppointments, setRecentAppointments] = useState<Appointment[]>([])
-  const [allAppointments, setAllAppointments] = useState<Appointment[]>([])
-  const [analysingIds, setAnalysingIds] = useState<string[]>([])
-  const [modalId, setModalId] = useState<Nullable<string>>(null)
+  const [allAppointments, setAllAppointments]       = useState<Appointment[]>([])
+  const [analysingIds, setAnalysingIds]     = useState<string[]>([])
+  const [modalId, setModalId]               = useState<Nullable<string>>(null)
   const appointmentsState = useAppointments()
 
   const loadDashboard = async () => {
-    const [{ data: statsData }, { data: appointmentData }, { data: engineersData }] = await Promise.all([
+    const [{ data: statsData }, { data: apptData }, { data: engData }] = await Promise.all([
       api.get('/api/dashboard/stats'),
       api.get('/api/appointments', { params: { page: 1, pageSize: 100 } }),
       api.get('/api/engineers'),
     ])
     setStats(statsData)
-    setRecentAppointments(appointmentData.records ?? [])
-    setAllAppointments(appointmentData.records ?? [])
-    setEngineers(engineersData ?? [])
+    setRecentAppointments(apptData.records ?? [])
+    setAllAppointments(apptData.records ?? [])
+    setEngineers(engData ?? [])
   }
 
-  useEffect(() => {
-    void loadDashboard()
-  }, [])
+  useEffect(() => { void loadDashboard() }, [])
+  useEffect(() => { setAllAppointments(appointmentsState.appointments) }, [appointmentsState.appointments])
 
-  useEffect(() => {
-    setAllAppointments(appointmentsState.appointments)
-  }, [appointmentsState.appointments])
-
-  const openAppointment = (id: string) => {
-    setSelectedId(id)
-    setView('appointment-detail')
-  }
-
-  const openEngineer = (name: string) => {
-    setSelectedEngineer(name)
-    setView('engineer-detail')
-  }
+  const openAppointment = (id: string) => { setSelectedId(id); setView('appointment-detail') }
+  const openEngineer    = (name: string) => { setSelectedEngineer(name); setView('engineer-detail') }
 
   const runAnalysis = async (id: string) => {
-    setAnalysingIds((prev) => [...prev, id])
+    setAnalysingIds((p) => [...p, id])
     try {
       await api.post(`/api/analyse/${id}`)
       await Promise.all([appointmentsState.fetchAppointments(), loadDashboard()])
     } finally {
-      setAnalysingIds((prev) => prev.filter((item) => item !== id))
+      setAnalysingIds((p) => p.filter((x) => x !== id))
     }
   }
 
   const navItems: Array<{ key: View; label: string }> = [
-    { key: 'dashboard', label: ' Dashboard' },
+    { key: 'dashboard',    label: ' Dashboard' },
     { key: 'appointments', label: 'Appointments' },
-    { key: 'engineers', label: 'Engineers' },
-    { key: 'tqr-report', label: 'TQR Report' },
+    { key: 'engineers',    label: 'Engineers' },
+    { key: 'tqr-report',  label: 'TQR Report' },
   ]
 
   return (
@@ -973,34 +1028,22 @@ export default function Dashboard() {
             <div>
               <div className="text-xs uppercase tracking-[0.35em] text-slate-500">Operations Overview</div>
               <div className="mt-2 text-3xl font-semibold text-white">
-                {view === 'dashboard' && 'Trade Manager Dashboard'}
-                {view === 'appointments' && 'Appointments'}
+                {view === 'dashboard'          && 'Trade Manager Dashboard'}
+                {view === 'appointments'       && 'Appointments'}
                 {view === 'appointment-detail' && `Appointment ${selectedId || ''}`}
-                {view === 'engineers' && 'Engineers'}
-                {view === 'engineer-detail' && `${selectedEngineer || ''} Detail`}
-                {view === 'tqr-report' && 'TQR Report'}
+                {view === 'engineers'          && 'Engineers'}
+                {view === 'engineer-detail'    && `${selectedEngineer || ''} Detail`}
+                {view === 'tqr-report'         && 'TQR Report'}
               </div>
             </div>
           </div>
 
-          {view === 'dashboard' && (
-            <DashboardView stats={stats} recentAppointments={recentAppointments} onOpenAppointment={openAppointment} onOpenModal={setModalId} />
-          )}
-          {view === 'appointments' && (
-            <AppointmentsView appointmentsState={appointmentsState} onOpenAppointment={openAppointment} onOpenModal={setModalId} onAnalyse={runAnalysis} analysingIds={analysingIds} />
-          )}
-          {view === 'appointment-detail' && selectedId && (
-            <AppointmentDetailView id={selectedId} onBack={() => setView('appointments')} onOpenEngineer={openEngineer} />
-          )}
-          {view === 'engineers' && (
-            <EngineersView engineers={engineers} onOpenEngineer={openEngineer} />
-          )}
-          {view === 'engineer-detail' && selectedEngineer && (
-            <EngineerDetailView name={selectedEngineer} appointments={allAppointments} onBack={() => setView('engineers')} onOpenAppointment={openAppointment} />
-          )}
-          {view === 'tqr-report' && (
-            <TQRReportView appointments={allAppointments} onAnalyse={runAnalysis} analysingIds={analysingIds} />
-          )}
+          {view === 'dashboard'          && <DashboardView stats={stats} recentAppointments={recentAppointments} onOpenAppointment={openAppointment} onOpenModal={setModalId} />}
+          {view === 'appointments'       && <AppointmentsView appointmentsState={appointmentsState} onOpenAppointment={openAppointment} onOpenModal={setModalId} onAnalyse={runAnalysis} analysingIds={analysingIds} />}
+          {view === 'appointment-detail' && selectedId && <AppointmentDetailView id={selectedId} onBack={() => setView('appointments')} onOpenEngineer={openEngineer} />}
+          {view === 'engineers'          && <EngineersView engineers={engineers} onOpenEngineer={openEngineer} />}
+          {view === 'engineer-detail'    && selectedEngineer && <EngineerDetailView name={selectedEngineer} appointments={allAppointments} onBack={() => setView('engineers')} onOpenAppointment={openAppointment} />}
+          {view === 'tqr-report'         && <TQRReportView appointments={allAppointments} onAnalyse={runAnalysis} analysingIds={analysingIds} />}
         </main>
       </div>
     </div>

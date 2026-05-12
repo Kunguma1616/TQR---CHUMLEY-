@@ -13,7 +13,8 @@ import {
   YAxis,
 } from 'recharts'
 
-const api = axios.create({ baseURL: 'http://localhost:8000' })
+const API_BASE_URL = 'http://localhost:8010'
+const api = axios.create({ baseURL: API_BASE_URL })
 
 export const colors = {
   brand: {
@@ -169,6 +170,16 @@ type TqrResult = {
   analysed_at?: string
 }
 
+type AppointmentDocument = {
+  id: string
+  title: string
+  fileType: string
+  contentType: string
+  source: string
+  category: string
+  externalUrl?: string
+}
+
 type Appointment = {
   Id: string
   Trade_Group_Postcode__c?: string
@@ -197,13 +208,14 @@ type Appointment = {
   SchedStartTimeFormatted?: string
   ArrivalWindowStartTimeFormatted?: string
   Duration?: number
+  ActualDurationMinutes?: number | null
   Street?: string
   City?: string
   PostalCode?: string
   Subject?: string
   tqrResult?: TqrResult | null
   tqrScore?: number | null
-  documents?: RelatedDocument[]
+  documents?: AppointmentDocument[]
   workOrderId?: string | null
   workOrder?: {
     Id: string
@@ -223,16 +235,6 @@ type Appointment = {
   } | null
   site?: string | null
   accountManager?: string | null
-}
-
-type RelatedDocument = {
-  id: string
-  title: string
-  fileType?: string
-  contentType?: string
-  source?: string
-  category?: string
-  externalUrl?: string
 }
 
 type DashboardStats = {
@@ -323,6 +325,48 @@ const getTradeGroupLabel = (appointment: Pick<Appointment, 'Trade_Group_Region__
   appointment.Trade_Group_Region__c?.trim() || appointment.Trade_Group_Postcode__c?.trim() || appointment.Scheduled_Trade__c?.trim() || 'Unknown'
 const getStartTimeLabel = (appointment: Pick<Appointment, 'ActualStartTimeFormatted' | 'SchedStartTimeFormatted' | 'ArrivalWindowStartTimeFormatted'>) =>
   appointment.ActualStartTimeFormatted || appointment.SchedStartTimeFormatted || appointment.ArrivalWindowStartTimeFormatted
+
+const parseUKDatetime = (s?: string | null): Date | null => {
+  if (!s) return null
+  const m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2})$/)
+  if (!m) return null
+  return new Date(+m[3], +m[2] - 1, +m[1], +m[4], +m[5])
+}
+
+const formatMins = (mins: number): string => {
+  if (mins < 60) return `${mins} mins`
+  const h = Math.floor(mins / 60)
+  const m = mins % 60
+  return m === 0 ? `${h}h` : `${h}h ${m}m`
+}
+
+const getActualDurationLabel = (appointment: Pick<Appointment, 'ActualDurationMinutes' | 'Duration' | 'ActualStartTimeFormatted' | 'ActualEndTimeFormatted' | 'SchedStartTimeFormatted' | 'ArrivalWindowStartTimeFormatted'>): string | undefined => {
+  // Prefer backend-calculated value (actual start → actual end)
+  if (appointment.ActualDurationMinutes != null) {
+    return formatMins(appointment.ActualDurationMinutes)
+  }
+  // Calculate from actual start → actual end
+  const actualStart = parseUKDatetime(appointment.ActualStartTimeFormatted)
+  const actualEnd   = parseUKDatetime(appointment.ActualEndTimeFormatted)
+  if (actualStart && actualEnd && actualEnd > actualStart) {
+    return formatMins(Math.round((actualEnd.getTime() - actualStart.getTime()) / 60000))
+  }
+  // Fallback: best available start → actual end
+  const bestStart = parseUKDatetime(
+    appointment.ActualStartTimeFormatted ||
+    appointment.SchedStartTimeFormatted ||
+    appointment.ArrivalWindowStartTimeFormatted
+  )
+  if (bestStart && actualEnd && actualEnd > bestStart) {
+    return formatMins(Math.round((actualEnd.getTime() - bestStart.getTime()) / 60000))
+  }
+  // Last resort: Salesforce Duration field — stored in HOURS, convert to mins
+  if (appointment.Duration) {
+    const mins = Math.round(appointment.Duration * 60)
+    return `${formatMins(mins)} (scheduled)`
+  }
+  return undefined
+}
 const getScoreBandExplanation = (score?: number) => {
   if (score === undefined || score === null) return null
   if (score >= 9) return { band: '9-10', label: 'Perfect', why: 'The AI judged the evidence to be top-tier: clear documentation, strong finish quality, and no visible concerns.' }
@@ -348,7 +392,11 @@ const getDisplayOutcomeForField = (field: TqrField, opts?: { forceReview?: boole
     if (field.score <= 6) return 'Review'
     return 'Pass'
   }
-  return field.outcome
+  const value = String(field.value ?? field.salesforceValue ?? '').trim().toLowerCase()
+  const outcome = String(field.outcome ?? '').trim()
+  if (value === 'yes' || value === 'creditaccount' || value === 'credit account' || value === 'na_customernotpresent') return 'Pass'
+  if (value === 'no') return outcome.toLowerCase() === 'review' ? 'Review' : 'Fail'
+  return outcome || 'Review'
 }
 
 const getEffectiveSalesforceValueForScore = (key: keyof TqrFields, score?: number) => {
@@ -654,7 +702,12 @@ function TQRTradeChart({
   )
 }
 
-function DashboardView({ stats }: { stats: DashboardStats | null }) {
+function DashboardView({ stats, statsError, statsLoading, onRetry }: {
+  stats: DashboardStats | null
+  statsError: string | null
+  statsLoading: boolean
+  onRetry: () => void
+}) {
   const tradeGroupChartData = useMemo(
     () => stats?.byTradeGroup ?? [],
     [stats],
@@ -662,6 +715,20 @@ function DashboardView({ stats }: { stats: DashboardStats | null }) {
 
   return (
     <div style={{ display: 'grid', gap: 20 }}>
+      {statsError && (
+        <div style={{ background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 10, padding: '16px 20px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
+          <div style={{ fontSize: 13, color: '#dc2626', fontWeight: 600 }}>⚠ {statsError}</div>
+          <button
+            onClick={onRetry}
+            style={{ flexShrink: 0, background: colors.primary.darker, color: '#fff', border: 'none', borderRadius: 8, padding: '8px 20px', fontSize: 12, fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit' }}
+          >
+            Retry
+          </button>
+        </div>
+      )}
+      {statsLoading && (
+        <div style={{ fontSize: 13, color: colors.text.grayscale.subtle, padding: '8px 0' }}>Loading dashboard data...</div>
+      )}
       <div style={{ display: 'grid', gap: 14, gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))' }}>
         <StatCard title="Not Checked By TM's" value={`${stats?.totalRecords ?? 0}`} note="Visit complete jobs from the last 90 days still waiting for Trade Manager review." />
       </div>
@@ -687,108 +754,309 @@ function AppointmentsView({
   page: number
   totalPages: number
   loading: boolean
-  filters: { search: string; engineer: string; trade: string; sector: string }
-  setFilters: React.Dispatch<React.SetStateAction<{ search: string; engineer: string; trade: string; sector: string }>>
+  filters: { search: string; engineer: string; trade: string; sector: string; tradeGroup: string }
+  setFilters: React.Dispatch<React.SetStateAction<{ search: string; engineer: string; trade: string; sector: string; tradeGroup: string }>>
   setPage: React.Dispatch<React.SetStateAction<number>>
   onOpenAppointment: (id: string) => void
   onOpenWorkOrder: (workOrderId: string | null | undefined) => void
 }) {
-  return (
-    <div style={{ display: 'grid', gap: 20 }}>
-      <div style={{ ...cardStyle, padding: 14, display: 'grid', gap: 10, gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))' }}>
-        <input style={compactInput} placeholder="Search queue" value={filters.search} onChange={(e) => setFilters((s) => ({ ...s, search: e.target.value }))} />
-        <input style={compactInput} placeholder="Filter engineer" value={filters.engineer} onChange={(e) => setFilters((s) => ({ ...s, engineer: e.target.value }))} />
-        <input style={compactInput} placeholder="Filter trade" value={filters.trade} onChange={(e) => setFilters((s) => ({ ...s, trade: e.target.value }))} />
-        <input style={compactInput} placeholder="Filter sector type" value={filters.sector} onChange={(e) => setFilters((s) => ({ ...s, sector: e.target.value }))} />
+  const [lookupResults, setLookupResults] = useState<Appointment[]>([])
+  const [lookupLoading, setLookupLoading] = useState(false)
+  const [lookupDone, setLookupDone] = useState(false)
+
+  const isApptNumber = /^SA-?\d{4,}/i.test(filters.search.trim())
+
+  useEffect(() => {
+    const q = filters.search.trim()
+    if (!isApptNumber || q.length < 4) {
+      setLookupResults([])
+      setLookupDone(false)
+      return
+    }
+    setLookupLoading(true)
+    setLookupDone(false)
+    const timer = setTimeout(async () => {
+      try {
+        const { data } = await api.get('/api/appointments/lookup', { params: { q } })
+        setLookupResults(data.records || [])
+      } catch { setLookupResults([]) } finally {
+        setLookupLoading(false)
+        setLookupDone(true)
+      }
+    }, 400)
+    return () => clearTimeout(timer)
+  }, [filters.search, isApptNumber])
+
+  const pendingAppointments = appointments.filter((row) => !row.Post_Visit_Report_Check__c)
+  const visibleAppointments = pendingAppointments.filter((row) => {
+    const tradeGroup = getTradeGroupLabel(row).toLowerCase()
+    const filterValue = filters.tradeGroup.trim().toLowerCase()
+    if (!filterValue) return true
+    return tradeGroup.includes(filterValue)
+  })
+
+  const renderTable = (rows: Appointment[]) => (
+    <div style={{ ...cardStyle, padding: 16, overflow: 'hidden' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 18, alignItems: 'center', marginBottom: 12 }}>
+        <div>
+          <p style={metaLabel}>Post Visit Report - Last 90 Days</p>
+          <div style={{ marginTop: 4, color: colors.primary.darker, fontSize: 18, fontWeight: 800 }}>TQR Not Submitted</div>
+          <div style={{ marginTop: 4, color: colors.text.grayscale.subtle, fontSize: 12 }}>All jobs still waiting to be submitted to Salesforce.</div>
+        </div>
+        <div style={{ color: colors.text.grayscale.subtle, fontSize: 12 }}>{loading ? 'Loading...' : `${rows.length} jobs`}</div>
       </div>
 
-      <div style={{ ...cardStyle, padding: 16, overflow: 'hidden' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 18, alignItems: 'center', marginBottom: 12 }}>
-          <div>
-            <p style={metaLabel}>Post Visit Report - Last 90 Days</p>
-            <div style={{ marginTop: 4, color: colors.primary.darker, fontSize: 18, fontWeight: 800 }}>Not Checked By TM&apos;s</div>
-          </div>
-          <div style={{ color: colors.text.grayscale.subtle, fontSize: 12 }}>{loading ? 'Loading...' : `${total} jobs`}</div>
-        </div>
-
-        <div style={{ overflowX: 'auto' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 1320, tableLayout: 'fixed' }}>
-            <colgroup>
-              <col style={{ width: 130 }} />
-              <col style={{ width: 120 }} />
-              <col style={{ width: 160 }} />
-              <col style={{ width: 105 }} />
-              <col style={{ width: 92 }} />
-              <col style={{ width: 98 }} />
-              <col style={{ width: 200 }} />
-              <col style={{ width: 90 }} />
-              <col style={{ width: 170 }} />
-              <col style={{ width: 86 }} />
-              <col style={{ width: 98 }} />
-              <col style={{ width: 96 }} />
-              <col style={{ width: 84 }} />
-              <col style={{ width: 122 }} />
-              <col style={{ width: 84 }} />
-              <col style={{ width: 112 }} />
-              <col style={{ width: 88 }} />
-              <col style={{ width: 88 }} />
-            </colgroup>
-            <thead>
-              <tr>
-                <th style={tableHead}>Trade Group Postcode</th>
-                <th style={tableHead}>Allocated Engineer</th>
-                <th style={tableHead}>Feedback Notes</th>
-                <th style={tableHead}>Appointment Number</th>
-                <th style={tableHead}>Status</th>
-                <th style={tableHead}>Scheduled Trade</th>
-                <th style={tableHead}>Description</th>
-                <th style={tableHead}>Actual End</th>
-                <th style={tableHead}>Attendance Report for Customer</th>
-                <th style={tableHead}>Workmanship</th>
-                <th style={tableHead}>Workmanship (2nd)</th>
-                <th style={tableHead}>CCT Charge Gross</th>
-                <th style={tableHead}>EPR Status</th>
-                <th style={tableHead}>Work Order</th>
-                <th style={tableHead}>Report</th>
-                <th style={tableHead}>Post Visit Report Check</th>
-                <th style={tableHead}>Decision Making</th>
-                <th style={tableHead}>Payment Attempted</th>
+      <div style={{ overflowX: 'auto' }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 760, tableLayout: 'fixed' }}>
+          <colgroup>
+            <col style={{ width: 170 }} />
+            <col style={{ width: 210 }} />
+            <col style={{ width: 150 }} />
+            <col style={{ width: 130 }} />
+            <col style={{ width: 160 }} />
+          </colgroup>
+          <thead>
+            <tr>
+              <th style={tableHead}>Trade Group Postcode</th>
+              <th style={tableHead}>Allocated Engineer</th>
+              <th style={tableHead}>Appointment Number</th>
+              <th style={tableHead}>Actual End</th>
+              <th style={tableHead}>Work Order</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => {
+              const isHighlighted = filters.search.trim().length >= 3 && (row.AppointmentNumber || '').toLowerCase().includes(filters.search.trim().toLowerCase())
+              return (
+              <tr key={row.Id} style={isHighlighted ? { background: '#fffbeb', outline: '2px solid #f59e0b' } : undefined}>
+                <td style={{ ...tableCell, fontWeight: 600 }}>{getTradeGroupLabel(row)}</td>
+                <td style={tableCell}>{row.AllocatedEngineerName || 'Unassigned'}</td>
+                <td style={{ ...tableCell, color: colors.primary.default, fontWeight: 800, cursor: 'pointer' }} onClick={() => onOpenAppointment(row.Id)}>{row.AppointmentNumber || 'N/A'}</td>
+                <td style={tableCell}>{formatDate(row.ActualEndTimeFormatted)}</td>
+                <td style={{ ...tableCell, color: row.workOrderId ? colors.primary.default : colors.text.grayscale.body, fontWeight: 700, cursor: row.workOrderId ? 'pointer' : 'default' }} onClick={() => row.workOrderId && onOpenWorkOrder(row.workOrderId)}>
+                  {row.Work_Order__c || row.workOrder?.WorkOrderNumber || 'Not linked'}
+                </td>
               </tr>
-            </thead>
-            <tbody>
-              {appointments.map((row) => (
-                <tr key={row.Id}>
-                  <td style={{ ...tableCell, fontWeight: 600 }}>{getTradeGroupLabel(row)}</td>
-                  <td style={tableCell}>{row.AllocatedEngineerName || 'Unassigned'}</td>
-                  <td style={tableCell}>{row.Feedback_Notes__c || 'No feedback'}</td>
-                  <td style={{ ...tableCell, color: colors.primary.default, fontWeight: 800, cursor: 'pointer' }} onClick={() => onOpenAppointment(row.Id)}>{row.AppointmentNumber || 'N/A'}</td>
-                  <td style={tableCell}><StatusBadge status={row.Status} /></td>
-                  <td style={tableCell}>{row.Scheduled_Trade__c || 'Not set'}</td>
-                  <td style={tableCell}>{row.Description || 'No description'}</td>
-                  <td style={tableCell}>{formatDate(row.ActualEndTimeFormatted)}</td>
-                  <td style={tableCell}>{row.Attendance_Report_for_Customer__c || 'No attendance report'}</td>
-                  <td style={tableCell}>{row.Workmanship__c || 'Not scored'}</td>
-                  <td style={tableCell}>{row.Workmanship1__c || 'Not scored'}</td>
-                  <td style={tableCell}>{formatMoney(row.CCT_Charge_Gross__c)}</td>
-                  <td style={tableCell}>{row.EPR_Status__c || 'Pending'}</td>
-                  <td style={{ ...tableCell, color: row.workOrderId ? colors.primary.default : colors.text.grayscale.body, fontWeight: 700, cursor: row.workOrderId ? 'pointer' : 'default' }} onClick={() => row.workOrderId && onOpenWorkOrder(row.workOrderId)}>
-                    {row.Work_Order__c || row.workOrder?.WorkOrderNumber || 'Not linked'}
-                  </td>
-                  <td style={tableCell}>{row.Report__c || 'Pending'}</td>
-                  <td style={tableCell}>{row.Post_Visit_Report_Check__c || 'Pending TM Review'}</td>
-                  <td style={tableCell}>{row.Decision_Making__c || 'Pending'}</td>
-                  <td style={tableCell}>{row.Payment_Attempted__c || 'Pending'}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+              )
+            })}
+            {rows.length === 0 && (
+              <tr>
+                <td style={tableCell} colSpan={5}>No jobs waiting to be submitted.</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+
+  return (
+    <div style={{ display: 'grid', gap: 20 }}>
+      {/* Big prominent search bar */}
+      <div style={{ ...cardStyle, padding: '20px 24px' }}>
+        <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: '0.14em', textTransform: 'uppercase', color: colors.primary.darker, marginBottom: 10 }}>
+          Find Appointment
+        </div>
+        <div style={{ position: 'relative', display: 'flex', gap: 10, alignItems: 'center' }}>
+          <div style={{ position: 'relative', flex: 1 }}>
+            <span style={{ position: 'absolute', left: 14, top: '50%', transform: 'translateY(-50%)', fontSize: 18, pointerEvents: 'none', color: '#94a3b8' }}>🔍</span>
+            <input
+              style={{ width: '100%', boxSizing: 'border-box', border: '2px solid ' + (filters.search ? colors.primary.default : '#dbe4f0'), borderRadius: 10, padding: '13px 16px 13px 44px', fontSize: 15, fontWeight: 500, color: '#1e293b', background: '#fff', outline: 'none', transition: 'border-color 0.2s' }}
+              placeholder="Type an appointment number, e.g. SA-773659, or engineer name, description..."
+              value={filters.search}
+              onChange={(e) => setFilters((s) => ({ ...s, search: e.target.value }))}
+              onKeyDown={(e) => { if (e.key === 'Escape') setFilters((s) => ({ ...s, search: '' })) }}
+              autoFocus={false}
+            />
+            {filters.search && (
+              <button onClick={() => { setFilters((s) => ({ ...s, search: '' })); setLookupResults([]); setLookupDone(false) }} style={{ position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', fontSize: 18, cursor: 'pointer', color: '#94a3b8', lineHeight: 1 }}>×</button>
+            )}
+          </div>
         </div>
 
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 16 }}>
-          <button style={primaryButton} disabled={page <= 1} onClick={() => setPage((p) => Math.max(1, p - 1))}>Previous</button>
-          <div style={{ color: colors.text.grayscale.subtle, fontSize: 12 }}>Page {page} of {totalPages}</div>
-          <button style={primaryButton} disabled={page >= totalPages} onClick={() => setPage((p) => Math.min(totalPages, p + 1))}>Next</button>
+        {/* Direct appointment number lookup results */}
+        {isApptNumber && (
+          <div style={{ marginTop: 14, borderRadius: 10, border: '1px solid #dbe4f0', overflow: 'hidden' }}>
+            <div style={{ background: '#f0f6ff', padding: '8px 14px', fontSize: 11, fontWeight: 800, letterSpacing: '0.1em', textTransform: 'uppercase', color: colors.primary.darker }}>
+              Direct Lookup Results
+            </div>
+            {lookupLoading && <div style={{ padding: '14px 16px', fontSize: 13, color: '#64748b' }}>Searching Salesforce...</div>}
+            {!lookupLoading && lookupDone && lookupResults.length === 0 && (
+              <div style={{ padding: '14px 16px', fontSize: 13, color: '#64748b' }}>No appointment found matching "{filters.search.trim()}".</div>
+            )}
+            {lookupResults.map((appt) => (
+              <div key={appt.Id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 16px', borderTop: '1px solid #f1f5f9', background: '#fff' }}>
+                <div>
+                  <span style={{ fontWeight: 800, color: colors.primary.default, fontSize: 14 }}>{appt.AppointmentNumber}</span>
+                  <span style={{ marginLeft: 12, fontSize: 13, color: '#374151' }}>{(appt as any).AllocatedEngineerName || 'No engineer'}</span>
+                  <span style={{ marginLeft: 12, fontSize: 12, color: '#94a3b8' }}>{appt.ActualEndTimeFormatted || ''}</span>
+                  <span style={{ marginLeft: 12, fontSize: 12, color: '#64748b' }}>{appt.Status}</span>
+                </div>
+                <button
+                  onClick={() => onOpenAppointment(appt.Id)}
+                  style={{ background: colors.primary.default, color: '#fff', border: 'none', borderRadius: 8, padding: '8px 18px', fontSize: 13, fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap' }}
+                >
+                  Open →
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Hint when not in appointment-number mode */}
+        {filters.search && !isApptNumber && (
+          <div style={{ marginTop: 8, fontSize: 12, color: colors.text.grayscale.subtle }}>
+            Filtering queue results below. To jump directly to an appointment, type its number (e.g. SA-773659).
+          </div>
+        )}
+
+        {/* Secondary filters row */}
+        <div style={{ display: 'grid', gap: 8, gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', marginTop: 12 }}>
+          <input style={compactInput} placeholder="Filter by trade group postcode" value={filters.tradeGroup} onChange={(e) => setFilters((s) => ({ ...s, tradeGroup: e.target.value }))} />
+          <input style={compactInput} placeholder="Filter by engineer" value={filters.engineer} onChange={(e) => setFilters((s) => ({ ...s, engineer: e.target.value }))} />
+          <input style={compactInput} placeholder="Filter by trade" value={filters.trade} onChange={(e) => setFilters((s) => ({ ...s, trade: e.target.value }))} />
+          <input style={compactInput} placeholder="Filter by sector type" value={filters.sector} onChange={(e) => setFilters((s) => ({ ...s, sector: e.target.value }))} />
         </div>
+      </div>
+      {renderTable(visibleAppointments)}
+      <div style={{ ...cardStyle, padding: '12px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
+        <div style={{ color: colors.text.grayscale.subtle, fontSize: 12 }}>
+          {loading ? 'Loading...' : `${visibleAppointments.length} jobs waiting to be submitted`}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+const categoryLabel: Record<string, string> = {
+  invoice: 'Invoice',
+  'service-report': 'Service Report',
+  payment: 'Payment',
+  document: 'Document',
+}
+
+const categoryColor: Record<string, React.CSSProperties> = {
+  invoice: { border: '1px solid rgba(245, 158, 11, 0.4)', background: 'rgba(245, 158, 11, 0.1)', color: '#f59e0b' },
+  'service-report': { border: '1px solid rgba(56, 189, 248, 0.4)', background: 'rgba(56, 189, 248, 0.1)', color: '#38bdf8' },
+  payment: { border: '1px solid rgba(52, 211, 153, 0.4)', background: 'rgba(52, 211, 153, 0.1)', color: '#34d399' },
+  document: { border: '1px solid #475569', background: 'rgba(71, 85, 105, 0.2)', color: '#cbd5e1' },
+}
+
+const RelatedDocuments = ({ documents }: { documents: AppointmentDocument[] }) => {
+  if (!documents || documents.length === 0) {
+    return (
+        <div style={{ ...cardStyle, padding: '28px 32px', borderTop: `3px solid ${colors.primary.darker}` }}>
+          <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: '0.16em', textTransform: 'uppercase', color: colors.primary.darker }}>
+            Related Documents
+          </div>
+        <div style={{ marginTop: 16, borderRadius: 12, border: '1px solid #dbe4f0', background: '#f8fbff', padding: '24px 16px', textAlign: 'center', fontSize: 14, color: '#64748b' }}>
+          No related documents found.
+        </div>
+      </div>
+    )
+  }
+
+  const openDoc = (doc: AppointmentDocument) => {
+    const url = doc.externalUrl
+      ? `${API_BASE_URL}/api/proxy-sf-url?url=${encodeURIComponent(doc.externalUrl)}`
+      : `${API_BASE_URL}/api/content/${doc.id}`
+    window.open(url, '_blank', 'noopener,noreferrer')
+  }
+
+  const documentPriority = (doc: AppointmentDocument) => {
+    const isPdf = (doc.contentType || '').toLowerCase() === 'application/pdf' || (doc.fileType || '').toLowerCase() === 'pdf'
+    const hasExternalUrl = Boolean(doc.externalUrl)
+    if (doc.category === 'invoice') {
+      if (isPdf && !hasExternalUrl && doc.source === 'invoice') return 1
+      if (isPdf && !hasExternalUrl) return 2
+      if (isPdf && hasExternalUrl) return 3
+      if (doc.source === 'invoice-record') return 4
+      return 5
+    }
+    if (doc.category === 'service-report') {
+      if (isPdf && !hasExternalUrl) return 1
+      if (isPdf && hasExternalUrl) return 2
+      return 3
+    }
+    if (isPdf && !hasExternalUrl) return 1
+    if (isPdf && hasExternalUrl) return 2
+    return 3
+  }
+
+  const normaliseDocumentKey = (doc: AppointmentDocument) => {
+    const category = doc.category || 'document'
+    const rawTitle = (doc.title || '').trim().toLowerCase()
+    if (category === 'invoice') {
+      const normalisedTitle = rawTitle
+        .replace(/^invoice\s*-\s*/i, '')
+        .replace(/^invoice\s+/i, '')
+        .trim()
+      return `${category}::${normalisedTitle}`
+    }
+    return `${category}::${rawTitle}`
+  }
+
+  const displayDocuments = Array.from(
+    documents.reduce((acc, doc) => {
+      const key = normaliseDocumentKey(doc)
+      const existing = acc.get(key)
+      if (!existing || documentPriority(doc) < documentPriority(existing)) {
+        acc.set(key, doc)
+      }
+      return acc
+    }, new Map<string, AppointmentDocument>()),
+  ).map(([, doc]) => doc)
+
+  const order = ['service-report', 'invoice', 'payment', 'document']
+  const groups = displayDocuments.reduce<Record<string, AppointmentDocument[]>>((acc, doc) => {
+    const cat = doc.category || 'document'
+    if (!acc[cat]) acc[cat] = []
+    acc[cat].push(doc)
+    return acc
+  }, {})
+
+  const sortedGroups = [
+    ...order.filter((cat) => groups[cat]?.length).map((cat) => ({ cat, docs: groups[cat] })),
+    ...Object.keys(groups).filter((cat) => !order.includes(cat)).map((cat) => ({ cat, docs: groups[cat] })),
+  ]
+
+  return (
+    <div style={{ ...cardStyle, padding: '28px 32px', borderTop: `3px solid ${colors.primary.darker}` }}>
+      <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: '0.16em', textTransform: 'uppercase', color: colors.primary.darker }}>
+        Related Documents
+        <span style={{ marginLeft: 8, borderRadius: 999, border: '1px solid #334155', background: '#1e293b', padding: '2px 8px', fontSize: 12, fontWeight: 400, color: '#94a3b8' }}>
+          {displayDocuments.length}
+        </span>
+      </div>
+      <div style={{ marginTop: 16, display: 'flex', flexDirection: 'column', gap: 24 }}>
+        {sortedGroups.map(({ cat, docs }) => (
+          <div key={cat}>
+            <div style={{ marginBottom: 8, fontSize: 12, textTransform: 'uppercase', letterSpacing: '0.25em', color: '#64748b' }}>
+              {categoryLabel[cat] ?? cat}
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {docs.map((doc) => (
+                <div key={doc.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, borderRadius: 12, border: '1px solid #dbe4f0', background: '#f8fbff', padding: '12px 16px' }}>
+                  <div style={{ display: 'flex', minWidth: 0, alignItems: 'center', gap: 12 }}>
+                    <span style={{ flexShrink: 0, borderRadius: 999, padding: '2px 8px', fontSize: 12, fontWeight: 600, ...(categoryColor[cat] ?? categoryColor.document) }}>
+                      {doc.fileType?.toUpperCase() || 'FILE'}
+                    </span>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 14, fontWeight: 700, color: '#17325E' }}>{doc.title}</div>
+                      <div style={{ fontSize: 12, color: '#646F86' }}>{categoryLabel[cat] ?? cat} · {doc.source}</div>
+                    </div>
+                  </div>
+                  <button
+                    style={{ marginLeft: 16, flexShrink: 0, borderRadius: 12, border: '1px solid #27549D', background: '#27549D', padding: '8px 16px', fontSize: 12, fontWeight: 700, color: '#fff', cursor: 'pointer' }}
+                    onClick={() => openDoc(doc)}
+                  >
+                    Open
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   )
@@ -806,7 +1074,15 @@ function AppointmentDetailView({
   onOpenWorkOrder,
   onRunAnalysis,
   onReanalyse,
+  onSaveToSalesforce,
+  saveLoading,
+  saveError,
+  saveSuccess,
   onDownloadReport,
+  relatedRecords,
+  relatedLoading,
+  expandedGroup,
+  onToggleGroup,
 }: {
   appointment: Appointment | null
   workOrderImages: WorkOrderImage[]
@@ -819,11 +1095,33 @@ function AppointmentDetailView({
   onOpenWorkOrder: (id: string | null | undefined) => void
   onRunAnalysis: (id: string) => void
   onReanalyse: (id: string) => void
+  onSaveToSalesforce: (id: string) => void
+  saveLoading: boolean
+  saveError: string | null
+  saveSuccess: boolean
   onDownloadReport: () => void
+  relatedRecords: { label: string; object: string; count: number; records: Record<string, string>[] }[]
+  relatedLoading: boolean
+  expandedGroup: string | null
+  onToggleGroup: (group: string) => void
 }) {
   const lastFetchedId = useRef<string | null>(null)
   const [selectedImage, setSelectedImage] = useState<WorkOrderImage | null>(null)
   const [imageDescriptionOverrides, setImageDescriptionOverrides] = useState<Record<string, string>>({})
+  const [documents, setDocuments] = useState<AppointmentDocument[]>([])
+  const [formDetail, setFormDetail] = useState<{ record: Record<string, string>; objectName: string; name: string } | null>(null)
+  const [formDetailLoading, setFormDetailLoading] = useState(false)
+
+  const openFormDetail = async (objectName: string, recordId: string, recordName: string) => {
+    setFormDetailLoading(true)
+    setFormDetail(null)
+    try {
+      const { data } = await api.get(`/api/form-records/${objectName}/${recordId}`)
+      setFormDetail({ record: data.record, objectName, name: recordName })
+    } catch { /* ignore */ } finally {
+      setFormDetailLoading(false)
+    }
+  }
 
   useEffect(() => {
     const wid = appointment?.workOrderId
@@ -832,6 +1130,10 @@ function AppointmentDetailView({
       onOpenWorkOrder(wid)
     }
   }, [appointment?.workOrderId])
+
+  useEffect(() => {
+    setDocuments(appointment?.documents ?? [])
+  }, [appointment])
 
   const needsFreshImageDescription = (description?: string | null) =>
     !description
@@ -891,15 +1193,6 @@ function AppointmentDetailView({
   const outcomeColor = (o?: string) => o === 'Pass' ? '#16a34a' : o === 'Review' ? '#d97706' : '#dc2626'
   const outcomeBackground = (o?: string) => o === 'Pass' ? '#f0fdf4' : o === 'Review' ? '#fffbeb' : '#fef2f2'
   const imageDescriptions = tqrResult?.image_descriptions || []
-  const documents = appointment.documents || []
-  const openDocument = (doc: RelatedDocument) => {
-    if (doc.externalUrl) {
-      window.open(doc.externalUrl, '_blank', 'noopener,noreferrer')
-      return
-    }
-    const base = String(api.defaults.baseURL || '').replace(/\/$/, '')
-    window.open(`${base}/api/content/${doc.id}?inline=true`, '_blank', 'noopener,noreferrer')
-  }
   const getImageDescription = (image: WorkOrderImage) =>
     imageDescriptionOverrides[image.id]
     || imageDescriptions.find((item) => item.id === image.id || item.title === image.title)?.description
@@ -942,7 +1235,49 @@ function AppointmentDetailView({
     tour.drive()
   }
 
+  const SKIP_FIELDS = new Set(['id', 'attributes', 'isdeleted', 'systemmodstamp'])
+  const formatFieldLabel = (key: string) =>
+    key.replace(/__c$/i, '').replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()).replace(/\bId\b/, 'ID')
+
   return (
+    <>
+    {/* Form Detail Modal */}
+    {(formDetail || formDetailLoading) && (
+      <>
+        <div onClick={() => { setFormDetail(null); setFormDetailLoading(false) }} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 10000 }} />
+        <div style={{ position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%,-50%)', zIndex: 10001, background: '#fff', borderRadius: 16, boxShadow: '0 24px 80px rgba(0,0,0,0.3)', width: '90vw', maxWidth: 760, maxHeight: '85vh', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+          {/* Modal header */}
+          <div style={{ padding: '18px 24px', borderBottom: '1px solid #e2e8f0', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#f8fafc', flexShrink: 0 }}>
+            <div>
+              <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: '0.14em', textTransform: 'uppercase', color: '#7c3aed', marginBottom: 4 }}>Form Detail</div>
+              <div style={{ fontSize: 16, fontWeight: 800, color: '#1e293b' }}>{formDetail?.name || 'Loading...'}</div>
+            </div>
+            <button onClick={() => { setFormDetail(null); setFormDetailLoading(false) }} style={{ background: 'none', border: 'none', fontSize: 22, cursor: 'pointer', color: '#94a3b8', lineHeight: 1, padding: '4px 8px' }}>×</button>
+          </div>
+          {/* Modal body */}
+          <div style={{ overflowY: 'auto', padding: '20px 24px', flex: 1 }}>
+            {formDetailLoading && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '32px 0', justifyContent: 'center' }}>
+                <div style={{ width: 20, height: 20, border: '2px solid #7c3aed', borderTopColor: 'transparent', borderRadius: '50%', animation: 'spin 0.8s linear infinite' }} />
+                <span style={{ fontSize: 13, color: '#64748b' }}>Loading form details from Salesforce...</span>
+              </div>
+            )}
+            {formDetail && (
+              <div style={{ display: 'grid', gap: '12px 24px', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))' }}>
+                {Object.entries(formDetail.record)
+                  .filter(([k, v]) => !SKIP_FIELDS.has(k.toLowerCase()) && v != null && v !== '' && v !== 'None' && v !== 'null' && String(v).trim() !== '')
+                  .map(([key, val]) => (
+                    <div key={key} style={{ borderBottom: '1px solid #f1f5f9', paddingBottom: 10 }}>
+                      <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', color: '#94a3b8', marginBottom: 4 }}>{formatFieldLabel(key)}</div>
+                      <div style={{ fontSize: 13, color: '#1e293b', lineHeight: 1.55, wordBreak: 'break-word' }}>{String(val)}</div>
+                    </div>
+                  ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </>
+    )}
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
 
       {/* Top bar */}
@@ -1013,7 +1348,7 @@ function AppointmentDetailView({
           <Field label="Scheduled Start" value={appointment.SchedStartTimeFormatted} />
           <Field label="Arrival Window" value={appointment.ArrivalWindowStartTimeFormatted} />
           <Field label="Actual End" value={appointment.ActualEndTimeFormatted} />
-          <Field label="Duration" value={appointment.Duration ? `${appointment.Duration} mins` : undefined} />
+          <Field label="Duration" value={getActualDurationLabel(appointment)} />
           <Field label="Scope of Works" value={appointment.workOrder?.Description} wide />
         </div>
       </Section>
@@ -1031,12 +1366,11 @@ function AppointmentDetailView({
             </div>
           ))}
         </div>
-        <div style={{ display: 'grid', gap: '20px 32px', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))' }}>
+        <div style={{ display: 'grid', gap: '20px 32px', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', marginBottom: 20 }}>
           {[
-            { label: 'Attendance Notes for Office', value: appointment.Attendance_Notes_for_Office__c },
+            { label: 'Description', value: appointment.Description || appointment.workOrder?.Description || appointment.Subject },
             { label: 'Attendance Report', value: appointment.Attendance_Report_for_Customer__c },
             { label: 'Feedback Notes', value: appointment.Feedback_Notes__c },
-            { label: 'Description', value: appointment.Description },
           ].filter(({ value }) => hasDisplayValue(value)).map(({ label, value }) => (
             <div key={label} style={{ background: '#f8fafc', borderRadius: 10, padding: '16px 18px' }}>
               <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: '#0f766e', marginBottom: 8 }}>{label}</div>
@@ -1044,31 +1378,61 @@ function AppointmentDetailView({
             </div>
           ))}
         </div>
+        {/* Attendance Notes for Office — always visible */}
+        <div style={{ background: '#f0fdf4', borderRadius: 10, padding: '16px 18px', border: '1px solid #bbf7d0' }}>
+          <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: '#0f766e', marginBottom: 8 }}>Attendance Notes for Office</div>
+          <div style={{ fontSize: 13, color: appointment.Attendance_Notes_for_Office__c ? colors.text.grayscale.body : colors.text.grayscale.caption, lineHeight: 1.7 }}>
+            {appointment.Attendance_Notes_for_Office__c || 'No attendance notes recorded for this appointment.'}
+          </div>
+        </div>
       </Section>
 
-      <Section title="Related Documents" accent="#7c3aed">
-        {documents.length === 0 ? (
-          <div style={{ fontSize: 13, color: colors.text.grayscale.subtle }}>No invoice, payment, or service report documents found.</div>
-        ) : (
-          <div style={{ display: 'grid', gap: 12 }}>
-            {documents.map((doc) => (
-              <div key={doc.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, padding: '14px 16px', borderRadius: 10, background: '#faf5ff', border: '1px solid #e9d5ff' }}>
-                <div style={{ minWidth: 0 }}>
-                  <div style={{ fontSize: 13, fontWeight: 700, color: colors.text.grayscale.title }}>{doc.title}</div>
-                  <div style={{ fontSize: 11, color: colors.text.grayscale.caption, marginTop: 4, textTransform: 'capitalize' }}>
-                    {doc.category || 'document'}{doc.fileType ? ` - ${doc.fileType}` : ''}{doc.source ? ` - ${doc.source}` : ''}
-                  </div>
-                </div>
-                <button
-                  onClick={() => openDocument(doc)}
-                  style={{ background: colors.primary.darker, color: '#fff', border: 'none', borderRadius: 8, padding: '8px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap' }}
-                >
-                  Open
-                </button>
-              </div>
-            ))}
-          </div>
+      <RelatedDocuments documents={documents} />
+
+      {/* Related Records */}
+      <Section title="Related Records" accent="#6d28d9">
+        {relatedLoading && (
+          <div style={{ fontSize: 13, color: colors.text.grayscale.subtle, padding: '8px 0' }}>Loading related records...</div>
         )}
+        {!relatedLoading && relatedRecords.length === 0 && (
+          <div style={{ fontSize: 13, color: colors.text.grayscale.subtle, padding: '8px 0' }}>No related form records found.</div>
+        )}
+        {!relatedLoading && relatedRecords.map((group) => (
+          <div key={group.label} style={{ marginBottom: 8, border: `1px solid ${colors.grayscale.border.subtle}`, borderRadius: 10, overflow: 'hidden' }}>
+            <button
+              onClick={() => group.count > 0 && onToggleGroup(group.label)}
+              style={{
+                width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                padding: '12px 16px', background: group.count > 0 ? '#faf5ff' : '#f8fafc',
+                border: 'none', cursor: group.count > 0 ? 'pointer' : 'default', fontFamily: 'inherit',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <div style={{ width: 8, height: 8, borderRadius: '50%', background: group.count > 0 ? '#7c3aed' : colors.grayscale.disabled }} />
+                <span style={{ fontSize: 13, fontWeight: 700, color: group.count > 0 ? '#4c1d95' : colors.text.grayscale.caption }}>{group.label}</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ fontSize: 12, fontWeight: 800, color: group.count > 0 ? '#7c3aed' : colors.text.grayscale.caption, background: group.count > 0 ? '#ede9fe' : colors.grayscale.border.subtle, borderRadius: 999, padding: '2px 10px' }}>{group.count}</span>
+                {group.count > 0 && <span style={{ fontSize: 11, color: '#7c3aed' }}>{expandedGroup === group.label ? '▲' : '▼'}</span>}
+              </div>
+            </button>
+            {expandedGroup === group.label && group.records.length > 0 && (
+              <div style={{ borderTop: `1px solid ${colors.grayscale.border.subtle}` }}>
+                {group.records.map((rec, i) => (
+                  <div key={rec.Id || i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 16px', borderBottom: i < group.records.length - 1 ? `1px solid ${colors.grayscale.border.subtle}` : 'none', background: '#fff' }}>
+                    <button
+                      onClick={() => rec.Id && openFormDetail(group.object, rec.Id, rec.Name || rec.Id)}
+                      style={{ background: 'none', border: 'none', padding: 0, fontSize: 13, fontWeight: 700, color: colors.primary.default, cursor: 'pointer', textDecoration: 'underline', fontFamily: 'inherit' }}
+                    >
+                      {rec.Name || rec.Id}
+                    </button>
+                    {rec.CreatedDate && <span style={{ fontSize: 11, color: colors.text.grayscale.caption }}>{rec.CreatedDate.slice(0, 10)}</span>}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
       </Section>
 
       {/* TQR AI Analysis */}
@@ -1123,6 +1487,9 @@ function AppointmentDetailView({
               {/* Summary */}
               {tqrResult.summary && (
                 <div style={{ fontSize: 13, color: colors.text.grayscale.body, marginBottom: 20, lineHeight: 1.7, padding: '14px 20px', borderLeft: `3px solid ${colors.primary.light}`, background: colors.primary.subtle, borderRadius: '0 8px 8px 0' }}>{tqrResult.summary}</div>
+              )}
+              {saveError && (
+                <div style={{ marginBottom: 20, background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 8, padding: '12px 16px', fontSize: 13, color: '#dc2626' }}>{saveError}</div>
               )}
 
               {/* Flags */}
@@ -1611,6 +1978,27 @@ function AppointmentDetailView({
                             ⛔ Hard Fail Triggered
                           </div>
                         )}
+                        <div style={{ padding: '12px 14px 6px' }}>
+                          <button
+                            style={{
+                              width: '100%',
+                              background: colors.primary.darker,
+                              border: `1px solid ${colors.primary.darker}`,
+                              borderRadius: 8,
+                              padding: '10px 14px',
+                              fontSize: 12,
+                              fontWeight: 700,
+                              color: '#fff',
+                              cursor: 'pointer',
+                              fontFamily: 'inherit',
+                              opacity: saveLoading ? 0.6 : 1,
+                            }}
+                            disabled={saveLoading}
+                            onClick={() => appointment?.Id && onSaveToSalesforce(appointment.Id)}
+                          >
+                            {saveLoading ? 'Saving...' : 'Save To Salesforce'}
+                          </button>
+                        </div>
                       </div>
                     </div>
                   )
@@ -1700,6 +2088,7 @@ function AppointmentDetailView({
       )}
 
     </div>
+    </>
   )
 }
 
@@ -1711,7 +2100,7 @@ export default function Dashboard() {
   const [page, setPage] = useState(1)
   const [totalPages, setTotalPages] = useState(1)
   const [loading, setLoading] = useState(false)
-  const [filters, setFilters] = useState({ search: '', engineer: '', trade: '', sector: '' })
+  const [filters, setFilters] = useState({ search: '', engineer: '', trade: '', sector: '', tradeGroup: '' })
   const [selectedAppointment, setSelectedAppointment] = useState<Appointment | null>(null)
   const [workOrderImages, setWorkOrderImages] = useState<WorkOrderImage[]>([])
   const [imagesLoading, setImagesLoading] = useState(false)
@@ -1719,10 +2108,26 @@ export default function Dashboard() {
   const [tqrResult, setTqrResult] = useState<TqrResult | null>(null)
   const [analyseLoading, setAnalyseLoading] = useState(false)
   const [analyseError, setAnalyseError] = useState<string | null>(null)
+  const [saveLoading, setSaveLoading] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [saveSuccess, setSaveSuccess] = useState(false)
+  const [statsError, setStatsError] = useState<string | null>(null)
+  const [statsLoading, setStatsLoading] = useState(false)
+  const [relatedRecords, setRelatedRecords] = useState<{ label: string; object: string; count: number; records: Record<string, string>[] }[]>([])
+  const [relatedLoading, setRelatedLoading] = useState(false)
+  const [expandedGroup, setExpandedGroup] = useState<string | null>(null)
 
   const loadStats = async () => {
-    const { data } = await api.get('/api/dashboard/stats')
-    setStats(data)
+    setStatsLoading(true)
+    setStatsError(null)
+    try {
+      const { data } = await api.get('/api/dashboard/stats')
+      setStats(data)
+    } catch {
+      setStatsError('Could not load dashboard data. Make sure the backend is running, then click Retry.')
+    } finally {
+      setStatsLoading(false)
+    }
   }
 
   const loadAppointments = async () => {
@@ -1730,8 +2135,8 @@ export default function Dashboard() {
     try {
       const { data } = await api.get('/api/appointments', {
         params: {
-          page,
-          pageSize: 25,
+          page: 1,
+          pageSize: 200,
           search: filters.search || undefined,
           engineer: filters.engineer || undefined,
           trade: filters.trade || undefined,
@@ -1740,7 +2145,7 @@ export default function Dashboard() {
       })
       setAppointments(data.records || [])
       setTotal(data.total || 0)
-      setTotalPages(data.totalPages || 1)
+      setTotalPages(1)
     } finally {
       setLoading(false)
     }
@@ -1751,15 +2156,28 @@ export default function Dashboard() {
     setImagesError(null)
     setTqrResult(null)
     setAnalyseError(null)
+    setSaveError(null)
+    setSaveSuccess(false)
+    setRelatedRecords([])
+    setExpandedGroup(null)
     const { data } = await api.get(`/api/appointments/${id}`)
     setSelectedAppointment(data)
     if (data.tqrResult) setTqrResult(data.tqrResult)
     setView('appointment-detail')
+    // Fetch related records in background
+    setRelatedLoading(true)
+    try {
+      const { data: rr } = await api.get(`/api/appointments/${id}/related-records`)
+      setRelatedRecords(rr.groups || [])
+    } catch { /* silently ignore */ } finally {
+      setRelatedLoading(false)
+    }
   }
 
   const runAnalysis = async (appointmentId: string, force = false) => {
     setAnalyseLoading(true)
     setAnalyseError(null)
+    setSaveError(null)
     try {
       const { data } = await api.post(`/api/analyse/${appointmentId}`, null, {
         params: force ? { force: true } : undefined,
@@ -1770,6 +2188,25 @@ export default function Dashboard() {
       setAnalyseError(msg || 'Analysis failed. Please try again.')
     } finally {
       setAnalyseLoading(false)
+    }
+  }
+
+  const saveToSalesforce = async (appointmentId: string) => {
+    setSaveLoading(true)
+    setSaveError(null)
+    try {
+      await api.post(`/api/save-to-salesforce/${appointmentId}`, tqrResult ?? undefined)
+      const { data } = await api.get(`/api/appointments/${appointmentId}`)
+      setSelectedAppointment(data)
+      if (data.tqrResult) setTqrResult(data.tqrResult)
+      await Promise.all([loadAppointments(), loadStats()])
+      setSaveSuccess(true)
+      setTimeout(() => setSaveSuccess(false), 5000)
+    } catch (e: unknown) {
+      const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      setSaveError(msg || 'Could not save to Salesforce. Please try again.')
+    } finally {
+      setSaveLoading(false)
     }
   }
 
@@ -1993,9 +2430,54 @@ export default function Dashboard() {
         @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800&display=swap');
         * { box-sizing: border-box; }
         @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes fadeInUp { from { opacity: 0; transform: translate(-50%, 20px); } to { opacity: 1; transform: translate(-50%, 0); } }
         body { margin: 0; background: #F5F7FA; font-family: 'Montserrat', 'Segoe UI', sans-serif; }
         button, input, select { font-family: 'Montserrat', 'Segoe UI', sans-serif; }
       `}</style>
+
+      {/* Centered save-success toast */}
+      {saveSuccess && (
+        <div style={{
+          position: 'fixed',
+          top: '50%',
+          left: '50%',
+          transform: 'translate(-50%, -50%)',
+          zIndex: 9999,
+          background: '#fff',
+          borderRadius: 16,
+          boxShadow: '0 20px 60px rgba(0,0,0,0.25)',
+          padding: '40px 48px',
+          textAlign: 'center',
+          maxWidth: 420,
+          width: '90vw',
+          animation: 'fadeInUp 0.3s ease',
+        }}>
+          <div style={{ fontSize: 52, marginBottom: 12 }}>✅</div>
+          <div style={{ fontSize: 20, fontWeight: 800, color: '#15803d', marginBottom: 8 }}>Saved to Salesforce!</div>
+          <div style={{ fontSize: 14, color: '#374151', lineHeight: 1.6 }}>
+            Thank you — the TQR results have been successfully saved inside Salesforce.
+          </div>
+          <button
+            onClick={() => setSaveSuccess(false)}
+            style={{
+              marginTop: 24,
+              background: '#15803d',
+              color: '#fff',
+              border: 'none',
+              borderRadius: 8,
+              padding: '10px 28px',
+              fontSize: 13,
+              fontWeight: 700,
+              cursor: 'pointer',
+            }}
+          >
+            OK
+          </button>
+        </div>
+      )}
+      {saveSuccess && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.35)', zIndex: 9998 }} onClick={() => setSaveSuccess(false)} />
+      )}
 
       <div style={{ maxWidth: 1680, margin: '0 auto', display: 'flex', minHeight: '100vh', flexWrap: 'wrap' }}>
         <aside style={{ width: 216, background: '#fff', borderRight: `1px solid ${colors.grayscale.border.subtle}`, padding: 14, boxShadow: '0 8px 30px rgba(23,50,94,0.06)' }}>
@@ -2028,7 +2510,7 @@ export default function Dashboard() {
             </div>
           )}
 
-          {view === 'dashboard' && <DashboardView stats={stats} />}
+          {view === 'dashboard' && <DashboardView stats={stats} statsError={statsError} statsLoading={statsLoading} onRetry={() => void loadStats()} />}
           {view === 'appointments' && (
             <AppointmentsView
               appointments={appointments}
@@ -2056,7 +2538,15 @@ export default function Dashboard() {
               onOpenWorkOrder={openWorkOrder}
               onRunAnalysis={(id) => runAnalysis(id, false)}
               onReanalyse={(id) => runAnalysis(id, true)}
+              onSaveToSalesforce={saveToSalesforce}
+              saveLoading={saveLoading}
+              saveError={saveError}
+              saveSuccess={saveSuccess}
               onDownloadReport={downloadReport}
+              relatedRecords={relatedRecords}
+              relatedLoading={relatedLoading}
+              expandedGroup={expandedGroup}
+              onToggleGroup={(g) => setExpandedGroup(prev => prev === g ? null : g)}
             />
           )}
         </main>

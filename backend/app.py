@@ -1365,10 +1365,20 @@ OUTPUT SCHEMA - return exactly this JSON structure:
 
 FIELD INSTRUCTIONS:
 
-FIELD customerSignature: Check signature.present first. If true = Yes/Pass.
-If false, check signature.hasServiceReportDocument — if a service report document is attached (e.g. SA-XXXXXX PDF), the customer signature is likely contained within that document and should be treated as Yes/Pass.
-If false and no service report document, scan notes for "customer not present", "no-one at property", "access via key" etc = NA_CustomerNotPresent/Pass.
-Only score No/Fail (hard fail trigger) if signature.present is false AND signature.hasServiceReportDocument is false AND there is no valid explanation in the notes.
+FIELD customerSignature:
+STEP 1 — FAKE SIGNATURE CHECK (takes priority over all other rules):
+Scan every entry in imageDescriptions for the text "FAKE_SIGNATURE_DETECTED". If any image description contains "FAKE_SIGNATURE_DETECTED", set value="No", outcome="Fail", confidence=the stated confidence, and cite the image description as evidence. This overrides signature.present=true. A NOS mark, a single X, a tick, a cross, or any other minimal mark is NOT a valid customer signature regardless of its position on the form.
+
+STEP 2 — NORMAL SIGNATURE CHECK (only if no FAKE_SIGNATURE_DETECTED was found):
+Check signature.present. This field is TRUE only when the Salesforce app actually captured a customer signature (Customer_Signature__c is set). If true = Yes/Pass.
+IMPORTANT: signature.hasServiceReportDocument being true does NOT confirm a signature was obtained. A service report document can exist with a completely blank signature section. Do NOT use hasServiceReportDocument alone as evidence of a signature.
+If signature.present is false, scan notes for "customer not present", "no-one at property", "access via key", "vacant property", "no access" etc = NA_CustomerNotPresent/Pass.
+If signature.present is false AND notes contain no valid absence reason, score No/Fail (hard fail trigger). A service report document existing alongside a missing signature does not change this outcome.
+Only note hasServiceReportDocument in your evidenceCited as context, never as the basis for a Pass.
+
+ADDITIONAL RULES:
+- Do NOT use the word "signature" to describe a single letter, cross, tick, or abbreviation such as NOS or N.O.S.
+- If any imageDescription contains "REQUIRES_HUMAN_REVIEW" in the signature statement, set outcome="Review" and populate reviewReason with "REQUIRES_HUMAN_REVIEW — confidence below 0.60".
 
 FIELD imagesQuality:
 Purpose:
@@ -1533,6 +1543,34 @@ the engineer report rather than pretending certainty where the evidence is thin.
 """
 
 
+_FAKE_SIG_RE = re.compile(
+    r"FAKE_SIGNATURE_DETECTED"
+    r"|(?<!\w)(?:nos|n\.o\.s\.?)(?!\w)"
+    r"|mark\s+is\s+(?:a\s+single\s+\w+|the\s+text\s+(?:nos|n\.o\.s))",
+    re.IGNORECASE,
+)
+
+
+def _detect_fake_signature(description: str) -> tuple[bool, float, str]:
+    """Returns (is_fake, confidence, detail_string)."""
+    if not description:
+        return False, 0.0, ""
+    m = re.search(
+        r"FAKE_SIGNATURE_DETECTED\s*\[CONFIDENCE:([\d.]+)\]\s*[—\-]\s*(.+?)(?:\.|$)",
+        description,
+        re.IGNORECASE,
+    )
+    if m:
+        try:
+            conf = min(max(float(m.group(1)), 0.0), 1.0)
+        except ValueError:
+            conf = 0.9
+        return True, conf, m.group(2).strip()
+    if _FAKE_SIG_RE.search(description):
+        return True, 0.85, "Pattern-matched fake signature indicator"
+    return False, 0.0, ""
+
+
 def _compute_weighted_verdict(
     fields: dict[str, Any],
     appointment_number: str = "UNKNOWN",
@@ -1566,14 +1604,21 @@ def _compute_weighted_verdict(
     sig_outcome = (sig_obj.get("outcome") or "").lower().strip()
     sig_sf_val = (sig_obj.get("salesforceValue") or "").lower().strip()
     has_sig_doc = bool(sig_obj.get("hasServiceReportDocument"))
+    fake_sig_detected = bool(sig_obj.get("fakeSignatureDetected"))
     sig_pass = (
-        sig_outcome in ("pass", "yes", "na_customernotpresent")
-        or sig_sf_val in ("yes", "na_customernotpresent")
-        or sig_value in ("Yes", "NA_CustomerNotPresent")
-        or has_sig_doc
+        not fake_sig_detected
+        and (
+            sig_outcome in ("pass", "yes", "na_customernotpresent")
+            or sig_sf_val in ("yes", "na_customernotpresent")
+            or sig_value in ("Yes", "NA_CustomerNotPresent")
+        )
     )
     if not sig_pass:
-        reason = "Customer signature missing with no valid reason"
+        reason = (
+            "Fake signature detected — mark is not a valid customer signature"
+            if fake_sig_detected
+            else "Customer signature missing with no valid reason"
+        )
         hard_fail_reasons.append(reason)
         log.warning("%s HARD FAIL → %s", prefix, reason)
     else:
@@ -1687,7 +1732,21 @@ STRICT ACCURACY RULES — you must follow all of these:
 - If an object could be several things, describe its visible features only — do not pick one and state it as fact.
 
 Focus on: equipment and tools present, fittings and fixtures, surfaces and materials, job progress, cleanliness, workmanship quality, and any obvious safety risks.
-Return a single plain paragraph only.
+
+SIGNATURE DETECTION — applies when this image shows or contains a customer signature area:
+If you can see a customer signature box, signature line, or any area where a customer mark has been captured (whether digital, pen-on-glass, or photographed paper), assess the mark carefully using these rules:
+
+- If the signature area contains ONLY any of the following — a single letter such as X, N, or O; the text "NOS", "N.O.S", "N.o.s", "nos", or any variation of that abbreviation; a cross; a tick; a single straight line; a single diagonal stroke; initials only; or any other minimal mark that does not resemble a full personal signature — state exactly: "FAKE_SIGNATURE_DETECTED [CONFIDENCE:0.0-1.0] — mark is [describe the mark exactly, e.g. a single X / the text NOS]"
+  Example: "FAKE_SIGNATURE_DETECTED [CONFIDENCE:0.98] — mark is the text NOS."
+  Example: "FAKE_SIGNATURE_DETECTED [CONFIDENCE:0.97] — mark is a single X."
+
+- If the signature area contains a genuine cursive or multi-stroke personal signature, state: "GENUINE_SIGNATURE [CONFIDENCE:0.0-1.0]" and note any printed name, date, or other visible detail alongside it.
+
+- Do NOT use the word "signature" to describe a single letter, cross, tick, or abbreviation such as NOS or N.O.S.
+- Do NOT assume a mark is a valid signature based on its position in the form alone.
+- If confidence is below 0.60 for any signature detection, always add: "REQUIRES_HUMAN_REVIEW" at the end of the signature statement.
+
+Return a single plain paragraph only. If the image contains a signature area, embed the signature statement within the paragraph.
 """
 
 
@@ -1829,7 +1888,7 @@ async def run_tqr_analysis(
             ],
         },
         "signature": {
-            "present": bool(appointment.get("Customer_Signature__c")) or bool(service_report_docs),
+            "present": bool(appointment.get("Customer_Signature__c")),
             "hasServiceReportDocument": bool(service_report_docs),
             "serviceReportDocuments": [doc.get("title") for doc in service_report_docs],
         },
@@ -1876,6 +1935,33 @@ async def run_tqr_analysis(
     raw = response.choices[0].message.content or ""
     payload = json_extract(raw)
     fields = payload.get("fields") or {}
+
+    # Python-side fake signature guard — scans all image descriptions
+    for img_desc in image_descriptions:
+        desc_text = img_desc.get("description", "")
+        is_fake, conf, fake_detail = _detect_fake_signature(desc_text)
+        if is_fake:
+            sig_field = dict(fields.get("customerSignature") or {})
+            sig_field["value"] = "No"
+            sig_field["outcome"] = "Review" if conf < 0.60 else "Fail"
+            sig_field["confidence"] = conf
+            sig_field["rationale"] = (
+                f"Fake signature detected in image '{img_desc.get('title')}': {fake_detail}. "
+                "This mark does not constitute a valid customer signature."
+            )
+            sig_field["evidenceCited"] = [
+                f"Image: {img_desc.get('title')}",
+                f"Detection: {fake_detail}",
+            ]
+            if conf < 0.60:
+                sig_field["reviewReason"] = "REQUIRES_HUMAN_REVIEW — confidence below 0.60"
+            sig_field["fakeSignatureDetected"] = True
+            fields["customerSignature"] = sig_field
+            log.warning(
+                "%s FAKE SIGNATURE detected in '%s' (conf=%.2f): %s",
+                prefix, img_desc.get("title"), conf, fake_detail,
+            )
+            break
 
     payment_field = fields.get("paymentAttempted") or {}
     payment_status = appointment.get("Payment_Attempted__c")
@@ -2386,12 +2472,10 @@ async def push_tqr_to_salesforce(appointment_id: str, result: dict[str, Any]) ->
     sig_outcome = (sig_obj.get("outcome") or "").lower().strip()
     sig_value = (sig_obj.get("value") or "").lower().strip()
     sig_sf_val = (sig_obj.get("salesforceValue") or "").lower().strip()
-    has_sig_doc = bool(sig_obj.get("hasServiceReportDocument"))
     did_sign = "Yes" if (
         sig_outcome in ("pass", "yes", "na_customernotpresent")
         or sig_sf_val in ("yes", "na_customernotpresent")
         or sig_value in ("yes", "na_customernotpresent")
-        or has_sig_doc
     ) else "No"
 
     pay_obj = fields.get("paymentAttempted") or {}

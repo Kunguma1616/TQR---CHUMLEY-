@@ -7,6 +7,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime                           
+import importlib
 from pathlib import Path
 from typing import Any
 from PIL import Image
@@ -1233,6 +1234,83 @@ async def fetch_version_bytes(version_id: str) -> tuple[bytes, str]:
     return response.content, response.headers.get("Content-Type", "application/octet-stream")
 
 
+async def fetch_document_bytes(doc: dict[str, Any]) -> tuple[bytes, str] | None:
+    version_id = str(doc.get("id") or "").strip()
+    if version_id and ":" not in version_id and not version_id.startswith("http"):
+        try:
+            return await fetch_version_bytes(version_id)
+        except Exception as exc:
+            log.warning("[Docs] Could not fetch ContentVersion bytes for %s: %s", version_id, exc)
+    external_url = str(doc.get("externalUrl") or "").strip()
+    if external_url:
+        sf = get_salesforce_client()
+        try:
+            response = await run_in_threadpool(
+                sf.session.get,
+                external_url,
+                headers={"Authorization": f"Bearer {sf.session_id}"},
+            )
+            response.raise_for_status()
+            return response.content, response.headers.get("Content-Type", "application/octet-stream")
+        except Exception as exc:
+            log.warning("[Docs] Could not fetch external document bytes for %s: %s", external_url, exc)
+    return None
+
+
+def _load_pymupdf() -> Any | None:
+    try:
+        return importlib.import_module("fitz")
+    except ModuleNotFoundError:
+        return None
+
+
+def _render_pdf_bytes_to_images(raw_bytes: bytes, title: str, max_pages: int = 3) -> list[dict[str, Any]]:
+    rendered: list[dict[str, Any]] = []
+    fitz = _load_pymupdf()
+    if fitz is None:
+        raise RuntimeError("PyMuPDF is not installed in the active backend environment")
+    pdf = fitz.open(stream=raw_bytes, filetype="pdf")
+    try:
+        page_count = min(pdf.page_count, max_pages)
+        for idx in range(page_count):
+            page = pdf.load_page(idx)
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            image_bytes = pix.tobytes("jpeg")
+            rendered.append(
+                {
+                    "id": f"{title}-page-{idx + 1}",
+                    "title": f"{title} - page {idx + 1}",
+                    "fileType": "jpg",
+                    "contentType": "image/jpeg",
+                    "base64": base64.b64encode(image_bytes).decode("utf-8"),
+                }
+            )
+    finally:
+        pdf.close()
+    return rendered
+
+
+async def build_service_report_images(documents: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    service_report_docs = [doc for doc in (documents or []) if doc.get("category") == "service-report"]
+    rendered_images: list[dict[str, Any]] = []
+    for doc in service_report_docs:
+        content_type = str(doc.get("contentType") or "").lower()
+        file_type = str(doc.get("fileType") or "").lower()
+        if "pdf" not in content_type and file_type != "pdf":
+            continue
+        fetched = await fetch_document_bytes(doc)
+        if not fetched:
+            continue
+        raw_bytes, _ = fetched
+        try:
+            rendered_images.extend(
+                _render_pdf_bytes_to_images(raw_bytes, doc.get("title") or "Service Report")
+            )
+        except Exception as exc:
+            log.warning("[Docs] Could not render service report PDF '%s': %s", doc.get("title"), exc)
+    return rendered_images
+
+
 async def fetch_content_version_by_id(version_id: str) -> dict[str, Any] | None:
     versions = await sf_query_all(
         f"""
@@ -1550,6 +1628,11 @@ _FAKE_SIG_RE = re.compile(
     re.IGNORECASE,
 )
 
+_GENUINE_SIG_RE = re.compile(
+    r"GENUINE_SIGNATURE\s*\[CONFIDENCE:([\d.]+)\](.*?)(?:\.|$)",
+    re.IGNORECASE,
+)
+
 
 def _detect_fake_signature(description: str) -> tuple[bool, float, str]:
     """Returns (is_fake, confidence, detail_string)."""
@@ -1569,6 +1652,21 @@ def _detect_fake_signature(description: str) -> tuple[bool, float, str]:
     if _FAKE_SIG_RE.search(description):
         return True, 0.85, "Pattern-matched fake signature indicator"
     return False, 0.0, ""
+
+
+def _detect_genuine_signature(description: str) -> tuple[bool, float, str]:
+    """Returns (is_genuine, confidence, detail_string)."""
+    if not description:
+        return False, 0.0, ""
+    m = _GENUINE_SIG_RE.search(description)
+    if not m:
+        return False, 0.0, ""
+    try:
+        conf = min(max(float(m.group(1)), 0.0), 1.0)
+    except ValueError:
+        conf = 0.75
+    detail = (m.group(2) or "").strip(" -–—")
+    return True, conf, detail
 
 
 def _compute_weighted_verdict(
@@ -1909,8 +2007,16 @@ async def run_tqr_analysis(
         len(invoices or []),
     )
 
-    log.info("%s Generating %d image description(s) for rubric scoring", prefix, len(images))
-    image_descriptions = await asyncio.gather(*(describe_single_image(img) for img in images))
+    service_report_images = await build_service_report_images(documents)
+    scoring_images = list(images) + service_report_images
+    log.info(
+        "%s Generating %d image description(s) for rubric scoring (%d job photo(s), %d rendered service-report page(s))",
+        prefix,
+        len(scoring_images),
+        len(images),
+        len(service_report_images),
+    )
+    image_descriptions = await asyncio.gather(*(describe_single_image(img) for img in scoring_images))
     evidence["imageDescriptions"] = image_descriptions
 
     content = (
@@ -1962,6 +2068,43 @@ async def run_tqr_analysis(
                 prefix, img_desc.get("title"), conf, fake_detail,
             )
             break
+
+    if not (fields.get("customerSignature") or {}).get("fakeSignatureDetected"):
+        best_genuine_match: tuple[dict[str, Any], float, str] | None = None
+        for img_desc in image_descriptions:
+            desc_text = img_desc.get("description", "")
+            is_genuine, conf, genuine_detail = _detect_genuine_signature(desc_text)
+            if is_genuine and (
+                best_genuine_match is None or conf > best_genuine_match[1]
+            ):
+                best_genuine_match = (img_desc, conf, genuine_detail)
+
+        if best_genuine_match:
+            img_desc, conf, genuine_detail = best_genuine_match
+            sig_field = dict(fields.get("customerSignature") or {})
+            sig_field["value"] = "Yes"
+            sig_field["salesforceValue"] = "Yes"
+            sig_field["confidence"] = conf
+            sig_field["fakeSignatureDetected"] = False
+            sig_field["evidenceCited"] = [
+                f"Image: {img_desc.get('title')}",
+                "Visual signature detection: genuine multi-stroke customer signature",
+            ]
+            if genuine_detail:
+                sig_field["evidenceCited"].append(f"Visible detail: {genuine_detail}")
+            sig_field["rationale"] = (
+                f"A genuine customer signature was visually detected in image "
+                f"'{img_desc.get('title')}'."
+            )
+            if genuine_detail:
+                sig_field["rationale"] += f" {genuine_detail}"
+            if conf < 0.60:
+                sig_field["outcome"] = "Review"
+                sig_field["reviewReason"] = "REQUIRES_HUMAN_REVIEW — confidence below 0.60"
+            else:
+                sig_field["outcome"] = "Pass"
+                sig_field["reviewReason"] = None
+            fields["customerSignature"] = sig_field
 
     payment_field = fields.get("paymentAttempted") or {}
     payment_status = appointment.get("Payment_Attempted__c")
